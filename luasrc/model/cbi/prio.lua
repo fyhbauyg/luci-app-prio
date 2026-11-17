@@ -370,8 +370,8 @@ o.description = translate("Uses the built-in speedtest client: it picks a mainla
 	"With \"Measure the line automatically\" on and the line idle, a successful run " ..
 	"replaces the remembered rate. A result under half of the previous one within a " ..
 	"day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled " ..
-	"test cannot pin the line; a genuine downgrade needs that day to pass, or switch " ..
-	"automatic measurement off and type the rate in by hand.")
+	"test under half cannot pin the line; a genuine downgrade needs that day to pass, or " ..
+	"switch automatic measurement off and type the rate in by hand.")
 o.write = function()
 	-- One measurement, not two. This used to run it inline and then again in a
 	-- background subshell, which charged the line for two full runs.

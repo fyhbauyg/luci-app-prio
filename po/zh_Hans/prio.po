@@ -340,7 +340,6 @@ msgstr "分开设置上传优先级"
 msgid "Off: one priority for both directions, which is what the device table shows. On: every device gets a second column and can be top priority for upload while staying low for download (or the other way round)."
 msgstr "关闭时：上传和下载用同一个优先级，设备列表里只有一列。开启时：每个设备多出一列，可以让它上传最高优先、下载最低（或者反过来）。"
 
-
 msgid "The shaper watches the round trip to this address: while it stays near the idle baseline the rate is left alone, when it climbs the rate comes down. Pick a stable public address near you; an unreachable one only produces a warning, because the shaper then has nothing to read."
 msgstr "整形器会盯着到这个地址的往返时间：接近空闲基线时不动速率，明显变大时把速率往下调。建议填一个离你近、稳定的公网地址；填了 ping 不通的地址只会让页面报警告，因为那时整形器读不到任何东西。"
 
@@ -356,7 +355,6 @@ msgstr "容量是测出来的，不是猜的：路由器用自己的免整形通
 msgid "Last measurement"
 msgstr "最近一次测量"
 
-
 msgid "Measure now (up to a minute on a slow line)"
 msgstr "立即测量（线路慢时最多约 1 分钟）"
 
@@ -369,5 +367,5 @@ msgstr "最低带，带 %d（推荐）"
 msgid "no local backlog in the last window -- traffic never exceeded the shaping rate. Normal on a quiet line; also what a rate set above the line's real capacity looks like."
 msgstr "上一窗口内本地没有积压——流量一直没超过整形速率。线路空闲时这是正常的，但整形速率高于线路真实能力时也是这个样子。"
 
-msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
+msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test under half cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
 msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。如果上一次测量至少有 5 Mbit/s，一天之内低于它一半的结果会被忽略，这样一次被限速的测速不会把速率钉死；真的降速了得等过这一天，或者关掉自动测量手动填速率。"

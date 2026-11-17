@@ -191,7 +191,7 @@ if [ -n "$MD" ] && [ -n "$MT" ]; then
 else
 	sk "还没有实测记录（线路忙时会跳过测量）"
 fi
-chk "校准已彻底移除" "test \$(grep -ci 'calib\|sweep the rate' /etc/init.d/prio) -eq 0"
+chk "校准已彻底移除" "test \$(grep -Eci 'calib|sweep the rate' /etc/init.d/prio) -eq 0"
 
 # 9. 重新学习
 uci -q delete prio.main.shaper_peak; uci -q delete prio.main.shaper_learned; uci -q commit prio

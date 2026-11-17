@@ -1359,10 +1359,11 @@ start_detect() {
 	logger -t luci-app-prio "bandwidth auto-detect started on $dev (capacity peak, pid $(cat "$DETECT_PID"))"
 }
 
-# Class throughput is read from the qdisc's own overlimit counter
-# (htb_overlimits below), not from interface counters: rx_bytes on WAN is the
-# *offer* -- packets the shaper will drop, retransmissions and other clients
-# are all in it -- so it can never prove that a given rate was the bottleneck.
+# Whether the shaped class was over its rate is read from the qdisc's own
+# cumulative overlimit counter (htb_overlimits, above), never from interface
+# counters: rx_bytes on WAN is the *offer* -- packets the shaper will drop,
+# retransmissions and other clients are all in it -- so it can never prove
+# that a given rate was the bottleneck.
 
 # The closer the probe target, the cleaner the signal: a hop inside the ISP's
 # own network shows the access link's queue immediately, while a far target
@@ -1579,12 +1580,14 @@ measure() {
 	case "$prev_dl" in ''|*[!0-9]*) prev_dl=0 ;; esac
 	prev_at="$(state_get measured_at)"
 	case "$prev_at" in ''|*[!0-9]*) prev_at=0 ;; esac
+	guard_reject=0
 	if [ "$dl" -ge 1000 ] && [ "$prev_dl" -ge 5000 ] &&
 	   [ $(( $(date +%s) - prev_at )) -lt 86400 ] &&
 	   [ "$dl" -lt $(( prev_dl * 50 / 100 )) ]; then
 		printf '%s\n' "$(date +%s)" > "$PRIO_STATE/measure_reject" 2>/dev/null
 		logger -t luci-app-prio "measurement ${dl}kbit is under half of ${prev_dl}kbit, ignored"
 		dl=$prev_dl
+		guard_reject=1
 	fi
 	dlok=0; ulok=0
 	[ "$dl" -ge 1000 ] && dlok=1
@@ -1600,7 +1603,8 @@ measure() {
 		# store the numbers even without the lock; the next start() will use them
 		state_set measured_dl "$dl"
 		state_set measured_ul "$ul"
-		state_set measured_at "$(date +%s)"
+		# Same rule as below: a result the guard rejected must not look fresh.
+		[ "$guard_reject" = 1 ] || state_set measured_at "$(date +%s)"
 		return 0
 	}
 	state_set measured_dl "$dl"
@@ -1608,7 +1612,12 @@ measure() {
 	# The timestamp describes the DOWNLOAD number (that is what the shaper uses
 	# and what the freshness checks read), so a failed download must not renew
 	# it -- otherwise an old value looks fresh forever.
-	[ "$dlok" = 1 ] && state_set measured_at "$(date +%s)"
+	# A result the guard above threw away must not renew it either: the guard
+	# reads this timestamp, so renewing it restarted the 24 h window on every
+	# rejected attempt and a genuinely slower line could never be accepted.
+	if [ "$dlok" = 1 ] && [ "$guard_reject" != 1 ]; then
+		state_set measured_at "$(date +%s)"
+	fi
 	# A fresh measurement replaces the rate, so the latency floor learned on
 	# the old path has to go with it: a stale baseline judges the new rate as
 	# congestion and cuts it for several windows before it re-learns. Truncated
