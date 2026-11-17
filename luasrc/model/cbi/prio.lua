@@ -367,6 +367,8 @@ o.description = translate("Downloads and uploads for a few seconds through the r
 o.write = function()
 	require("luci.sys").call("/etc/init.d/prio measure >/dev/null 2>&1")
 	require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")
+	-- Once the old numbers are gone, measure the line again straight away.
+	require("luci.sys").call("( sleep 5; /etc/init.d/prio measure ) >/dev/null 2>&1 &")
 end
 
 o = s:option(Value, "rtt_target", translate("Latency probe target"))
@@ -498,6 +500,23 @@ o:value("4", translate("4 bands"))
 o:value("8", translate("8 bands"))
 o.description = translate("Band 0 has the absolute highest priority. The remaining bands share bandwidth fairly.")
 
+o = s:option(ListValue, "default_band", translate("Priority for devices not in the list"))
+o.default = ""
+o.rmempty = true
+for i = 0, get_bands() - 1 do
+	o:value(tostring(i), translatef("Band %d", i))
+end
+o.description = translate("Everything that is not in the device list still goes through " ..
+	"the shaper; this is the band it gets. Empty means the lowest band, which is the " ..
+	"safe choice: a new device cannot take bandwidth away from one you configured.")
+
+o = s:option(Flag, "split_bands", translate("Separate upload priority"))
+o.default = 0
+o.rmempty = false
+o.description = translate("Off: one priority for both directions, which is what the device " ..
+	"table shows. On: every device gets a second column and can be top priority for " ..
+	"upload while staying low for download (or the other way round).")
+
 o = s:option(ListValue, "strict_bands", translate("Strict-priority levels"))
 o.default = 1
 o.rmempty = false
@@ -557,6 +576,12 @@ o.write = function()
 	-- The uplink estimate is committed at every start() too; leaving it
 	-- behind makes "forget" restore the old number on the very next reload.
 	u:delete("prio", "main", "uplink_learned")
+	-- The measured capacity is a cache of a past line; forget it too, otherwise
+	-- the next start() seeds the shaper from it and the "re-measure" promise of
+	-- this button is not kept.
+	u:delete("prio", "main", "measured_dl")
+	u:delete("prio", "main", "measured_ul")
+	u:delete("prio", "main", "measured_at")
 	u:commit("prio")
 	local fh = io.open("/var/run/luci-app-prio/shaper", "w")
 	if fh then fh:write("0\n") fh:close() end
@@ -725,7 +750,7 @@ for _, t in ipairs(read_leases()) do
 	end
 end
 
-o = d:option(ListValue, "band", translate("Priority Band (download)"))
+o = d:option(ListValue, "band", translate("Priority Band"))
 for i = 0, bands - 1 do
 	o:value(tostring(i), translatef("Band %d", i))
 end
@@ -733,17 +758,19 @@ o.default = 0
 o.rmempty = false
 o.width = "20%"
 
--- Upload is graded separately: the marks for the two directions are applied in
--- different chains (download by destination, upload by source), so a device can
--- be top priority on the way out and bottom on the way in.
-o = d:option(ListValue, "band_up", translate("Priority Band (upload)"))
-for i = 0, bands - 1 do
-	o:value(tostring(i), translatef("Band %d", i))
+-- Upload and download are two independent queues, but one priority is what
+-- people expect; the split is an advanced switch in the section above.
+local ok_split, split = pcall(function() return uci:get("prio", "main", "split_bands") end)
+if ok_split and split == "1" then
+	o = d:option(ListValue, "band_up", translate("Priority Band (upload)"))
+	for i = 0, bands - 1 do
+		o:value(tostring(i), translatef("Band %d", i))
+	end
+	o.default = ""
+	o.rmempty = true
+	o.width = "20%"
+	o.description = translate("Empty means the same band as download.")
 end
-o.default = ""
-o.rmempty = true
-o.width = "20%"
-o.description = translate("Empty means the same band as download.")
 
 -- ============================================================
 -- 保存后立即应用（修 P0-2）

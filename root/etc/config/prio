@@ -7,6 +7,11 @@ config main 'main'
 	# rate. 0 = use shaper_kbit / uplink_kbit exactly as configured.
 	option auto_bandwidth '1'
 	option bands '3'
+	# Devices that are not in the list are still shaped: they get this band.
+	# Empty means the lowest one.
+	option default_band ''
+	# 1 = let each device have a different priority for upload and download.
+	option split_bands '0'
 	option strict_bands '1'
 	option fq_codel '1'
 	option uplink '1'

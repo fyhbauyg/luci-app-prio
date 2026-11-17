@@ -425,3 +425,15 @@ msgstr "立即测量（约 10 秒）"
 
 msgid "Downloads and uploads for a few seconds through the router itself and records what the line actually delivered."
 msgstr "通过路由器自身下载、上传几秒钟，记录线路实际跑出来的速度。"
+
+msgid "Priority for devices not in the list"
+msgstr "未列出设备的优先级"
+
+msgid "Everything that is not in the device list still goes through the shaper; this is the band it gets. Empty means the lowest band, which is the safe choice: a new device cannot take bandwidth away from one you configured."
+msgstr "不在设备列表里的设备同样会经过整形器，这里指定它落在哪条带。留空表示最低的那条带 —— 这是安全的选择：新接入的设备不会抢走你已经配置好的设备的带宽。"
+
+msgid "Separate upload priority"
+msgstr "分开设置上传优先级"
+
+msgid "Off: one priority for both directions, which is what the device table shows. On: every device gets a second column and can be top priority for upload while staying low for download (or the other way round)."
+msgstr "关闭时：上传和下载用同一个优先级，设备列表里只有一列。开启时：每个设备多出一列，可以让它上传最高优先、下载最低（或者反过来）。"
