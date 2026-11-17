@@ -473,9 +473,14 @@ band_leaves() {
 	fq="$(state_get fq_codel)"
 	[ -n "$fq" ] || fq=1
 	[ "$fq" = "1" ] || return 0
+	# target 3ms, not the 5ms default: with the shaper deliberately running
+	# below the line rate, this queue is the one the gamer actually sits in, so
+	# its standing delay is worth two milliseconds of throughput. interval stays
+	# at the default 100ms -- 3ms is well below half of it, which is the only
+	# constraint fq_codel puts on the pair.
 	local i=1
 	while [ "$i" -le "$bands" ]; do
-		tc qdisc add dev "$dev" parent "${handle}:$i" fq_codel 2>>"$PRIO_STATE/err"
+		tc qdisc add dev "$dev" parent "${handle}:$i" fq_codel target 3ms 2>>"$PRIO_STATE/err"
 		i=$((i + 1))
 	done
 }
@@ -667,7 +672,7 @@ setup_downlink() {
 		# HTB leaves default to a plain pfifo; give the LAN class the same
 		# per-flow fairness the band classes get, otherwise a single local flow
 		# can starve the rest of the bridge.
-		tc qdisc add dev "$dev" parent 1:1 fq_codel 2>>"$PRIO_STATE/err"
+		tc qdisc add dev "$dev" parent 1:1 fq_codel target 3ms 2>>"$PRIO_STATE/err"
 		# cburst must be set explicitly: tc defaults it to 1600 bytes, which
 		# starves the burst at exactly the moment a download ramps up.
 		if ! tc class add dev "$dev" parent 1: classid 1:100 htb rate "${applied}kbit" ceil "${applied}kbit" \
