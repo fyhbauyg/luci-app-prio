@@ -514,10 +514,32 @@ o.rmempty = false
 o = s:option(Value, "uplink_kbit", translate("Uplink rate (kbit/s)"))
 o.datatype = "uinteger"
 o.placeholder = "0"
-o.description = translate("0 leaves the upload unshaped, which is the default: a 4G modem " ..
-	"then buffers an upload inside itself and this router cannot reorder what it never " ..
-	"queues. Enter a value below what the line really uploads at and the upload bands start " ..
-	"to matter; from there the same latency controller adjusts it automatically.")
+o.description = translate("0 means automatic: the upload stays open until it has seen " ..
+	"real upload traffic in three measuring windows (about a minute), then it starts " ..
+	"shaping at what the line actually delivered and the same latency controller trims " ..
+	"it. Enter a number to pin it instead. Leaving the upload unshaped lets a 4G modem " ..
+	"buffer it internally, where this router cannot reorder anything.")
+
+o = s:option(DummyValue, "_upshaper", translate("Uplink shaper"))
+o.cfgvalue = function()
+	local c = ""
+	if fs.access("/var/run/luci-app-prio/status") then
+		c = fs.readfile("/var/run/luci-app-prio/status") or ""
+	end
+	local v = c:match("upshaper:([^\n]+)")
+	if not v then
+		return translate("not reported yet")
+	end
+	if v == "auto" then
+		return translate("automatic -- measuring the upload first")
+	end
+	local n = v:match("^(%d+)")
+	n = n and tonumber(n) or 0
+	if n < 1 then
+		return translate("not reported yet")
+	end
+	return string.format("%.1f Mbit/s", n / 1000)
+end
 
 o = s:option(Flag, "downlink", translate("Shape Downlink (download)"))
 o.default = 1

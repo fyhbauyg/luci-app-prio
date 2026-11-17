@@ -475,16 +475,13 @@ setup_uplink() {
 
 	qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
 
+	# No rate known yet (uplink_kbit=0 and nothing learned): build the tree
+	# anyway at a rate the link can never reach, so the controller can start
+	# shaping later without rebuilding -- and measure the upload first.
+	local upauto=0
 	if [ "$applied" -lt 1000 ]; then
-		if ! tc qdisc add dev "$dev" root handle 1: ets bands "$bands" strict "$(strict_count "$bands")" 2>>"$PRIO_STATE/err"; then
-			echo "uplink:fail" >> "$PRIO_STATE/status"
-			return 1
-		fi
-		band_leaves "$dev" "$bands" 1
-		setup_filters "$dev" "$bands" 1
-		echo "uplink:ok" >> "$PRIO_STATE/status"
-		echo "upshaper:off" >> "$PRIO_STATE/status"
-		return 0
+		applied=1000000
+		upauto=1
 	fi
 
 	local burst=$((applied / 8 * 20))
@@ -516,7 +513,11 @@ setup_uplink() {
 	band_leaves "$dev" "$bands" 2
 	setup_filters "$dev" "$bands" 2
 	echo "uplink:ok" >> "$PRIO_STATE/status"
-	echo "upshaper:${applied}kbit" >> "$PRIO_STATE/status"
+	if [ "$upauto" = 1 ]; then
+		echo "upshaper:auto" >> "$PRIO_STATE/status"
+	else
+		echo "upshaper:${applied}kbit" >> "$PRIO_STATE/status"
+	fi
 	return 0
 }
 
@@ -950,6 +951,27 @@ start_detect() {
 			# download) never reached it: the controller that exists to stop an
 			# upload from wrecking the latency was the one thing not running.
 			up=$(up_rate_kbit)
+			# Auto mode: no number anywhere, so learn one. While the uplink is
+			# still open the observed throughput IS a lower bound of what the
+			# line can upload, which is exactly the seed the loop needs.
+			if [ "$up" -lt 1000 ] && [ "$thr_up" -gt 3000 ]; then
+				printf '%s\n' "$thr_up" >> "$PRIO_STATE/uptx"
+				tail -n 3 "$PRIO_STATE/uptx" > "$PRIO_STATE/uptx.tmp" 2>/dev/null &&
+					mv "$PRIO_STATE/uptx.tmp" "$PRIO_STATE/uptx" 2>/dev/null
+				useed=$(sort -n "$PRIO_STATE/uptx" 2>/dev/null | tail -n1)
+				case "$useed" in ''|*[!0-9]*) useed=0 ;; esac
+				nup=$(wc -l < "$PRIO_STATE/uptx" 2>/dev/null)
+				case "$nup" in ''|*[!0-9]*) nup=0 ;; esac
+				if [ "$nup" -ge 3 ] && [ "$useed" -ge 5000 ]; then
+					# start at what the line actually did, then let the
+					# latency loop trim it down to the knee
+					if apply_uplink_rate "$dev" "$useed"; then
+						printf '%s\n' "$useed" > "$PRIO_STATE/up_rate"
+						up=$useed
+						logger -t luci-app-prio "uplink learned from traffic: ${useed}kbit"
+					fi
+				fi
+			fi
 			if [ "$up" -ge 1000 ] && [ "$thr_up" -gt 1500 ]; then
 				urtt=$(rtt_avg_ms)
 				case "$urtt" in ''|*[!0-9]*) urtt=0 ;; esac
@@ -1394,6 +1416,7 @@ start() {
 	case "$upcfg" in ''|*[!0-9]*) upcfg=0 ;; esac
 	if [ "$upcfg" -lt 1000 ]; then
 		: > "$PRIO_STATE/up_rate"
+		: > "$PRIO_STATE/uptx"
 	fi
 
 	# "forget the learned rate" deletes both keys; anything left in tmpfs must

@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prio
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=61
+PKG_RELEASE:=63
 
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=congge
@@ -13,7 +13,7 @@ LUCI_DESCRIPTION:=Per-device network priority with nft marks and the ETS qdisc o
 # NOTE: sch_tbf and sch_fq_codel live in kmod-sched-core, sch_ets lives in
 # kmod-sched. There are no kmod-sched-tbf / kmod-sched-ets / kmod-sched-fq_codel
 # packages, so depending on them would break the build and the install.
-LUCI_DEPENDS:=+luci-base +luci-compat +nftables +tc-full +kmod-sched-core +kmod-sched +traceroute
+LUCI_DEPENDS:=+luci-base +luci-compat +nftables +tc-full +kmod-sched-core +kmod-sched
 LUCI_PKGARCH:=all
 
 # These three must be defined BEFORE luci.mk is included: luci.mk expands

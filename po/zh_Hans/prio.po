@@ -240,8 +240,8 @@ msgstr "保存后立即生效。关闭时恢复之前的加速模式。"
 msgid "Uplink rate (kbit/s)"
 msgstr "上行速率（kbit/s）"
 
-msgid "0 leaves the upload unshaped, which is the default: a 4G modem then buffers an upload inside itself and this router cannot reorder what it never queues. Enter a value below what the line really uploads at and the upload bands start to matter; from there the same latency controller adjusts it automatically."
-msgstr "填 0 表示上行不整形，这是默认值：4G 模组会把上传堆在自己内部，路由器连队列都看不到，自然排不了序。填一个低于线路真实上传能力的值，上传方向的分带才开始起作用；之后由同一个延迟控制器自动调节。"
+msgid "0 means automatic: the upload stays open until it has seen real upload traffic in three measuring windows (about a minute), then it starts shaping at what the line actually delivered and the same latency controller trims it. Enter a number to pin it instead. Leaving the upload unshaped lets a 4G modem buffer it internally, where this router cannot reorder anything."
+msgstr "填 0 表示全自动：上行先不整形，等测得三次真实上传流量（约一分钟）后，就按线路实际跑到的峰值开始整形，之后交给同一个延迟控制器微调。填具体数值则固定下来。上行长期不整形的话，4G 模组会把上传堆在自己内部，路由器连队列都看不到，自然排不了序。"
 
 msgid "Shape Downlink (download)"
 msgstr "整形下行（下载）"
@@ -353,3 +353,12 @@ msgstr "已开启"
 
 msgid "This is a local address: pinging it measures your own network, not the line. Use a public address."
 msgstr "这是内网地址：ping 它测到的是你自己的局域网，不是线路。请填公网地址。"
+
+msgid "Uplink shaper"
+msgstr "上行整形"
+
+msgid "not reported yet"
+msgstr "尚未上报"
+
+msgid "automatic -- measuring the upload first"
+msgstr "自动 —— 正在先测上传能力"
