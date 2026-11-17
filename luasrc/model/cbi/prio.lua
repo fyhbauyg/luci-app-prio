@@ -246,8 +246,11 @@ o.cfgvalue = function()
 		return translate("Built -- the shaper is holding traffic back, so priority is in effect")
 	end
 	if st == "none" then
-		return translate("None -- traffic never queues, so the bands cannot reorder anything. " ..
-			"The shaping rate is probably above what the line really delivers.")
+		-- A live reading, not a verdict: with no backlog there is nothing to
+		-- reorder, which is what an idle line looks like. Saying "no queue was
+		-- ever built" here contradicted the "Downlink OK" row right below it.
+		return translate("nothing queued right now -- no traffic is waiting, so there is " ..
+			"nothing to reorder at this moment. This is a live reading, not a fault.")
 	end
 	if st == "idle" then
 		return translate("idle (no traffic in the last minute)")
@@ -321,12 +324,6 @@ o.default = 0
 o.rmempty = false
 o.description = translate("Saving applies immediately. Turning it off restores the previous acceleration mode.")
 
-o = s:option(Flag, "auto_hnat_off", translate("Use software flow offloading"))
-o.default = 1
-o.rmempty = false
-o.description = translate("Hardware HNAT bypasses the qdisc and would make priority useless. " ..
-	"Software flow offloading keeps packets on the qdisc path.")
-
 o = s:option(Flag, "auto_bandwidth", translate("Measure the line automatically"))
 o.default = 1
 o.rmempty = false
@@ -360,72 +357,34 @@ o.cfgvalue = function()
 end
 
 o = s:option(Button, "_measure", translate("Measured capacity"))
-o.inputtitle = translate("Measure now (takes about 15 seconds)")
+o.inputtitle = translate("Measure now (up to a minute on a slow line)")
 o.inputstyle = "reload"
 o.description = translate("Uses the built-in speedtest client: it picks a mainland node " ..
 	"(Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the " ..
-	"line actually delivered. It costs real traffic -- roughly 300 MB on a fast line.")
+	"line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. " ..
+	"With \"Measure the line automatically\" on and the line idle, a successful run " ..
+	"replaces the remembered rate; that is also what to press when the line itself " ..
+	"changed and has to be learned again.")
 o.write = function()
+	-- One measurement, not two. This used to run it inline and then again in a
+	-- background subshell, which charged the line for two full runs.
 	require("luci.sys").call("/etc/init.d/prio measure >/dev/null 2>&1")
 	require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")
-	-- Once the old numbers are gone, measure the line again straight away.
-	require("luci.sys").call("( sleep 5; /etc/init.d/prio measure ) >/dev/null 2>&1 &")
 end
 
-o = s:option(Value, "rtt_target", translate("Latency probe target"))
-o.default = "223.5.5.5"
-o.datatype = "host"
--- A private or loopback address measures the LAN, not the line: the round trip
--- is a fraction of a millisecond, the controller sees "no congestion" and walks
--- the rate up until the queue is back inside the modem, where priority does
--- nothing at all. Refuse it at the source instead of silently degrading.
-o.validate = function(self, value)
-	if not value or value == "" then return value end
-	local a, b = value:match("^(%d+)%.(%d+)%.")
-	a, b = tonumber(a), tonumber(b)
-	if a == 10 or a == 127 or a == 0
-	   or (a == 192 and b == 168)
-	   or (a == 172 and b and b >= 16 and b <= 31)
-	   or (a == 169 and b == 254) then
-		return nil, translate("This is a local address: pinging it measures your " ..
-			"own network, not the line. Use a public address.")
-	end
-	return value
-end
-o.description = translate("The shaper watches the round trip to this address: while it " ..
-	"stays near the idle baseline the rate is left alone, when it climbs the rate comes " ..
-	"down. Pick a stable public address near you; an unreachable one only produces a " ..
-	"warning, because the shaper then has nothing to read.")
+o = s:option(Flag, "downlink", translate("Shape Downlink (download)"))
+o.default = 1
+o.rmempty = false
 
--- The picker shells out to traceroute, which is no longer a hard dependency
--- (the package name did not exist in the firmware feed and made apk refuse the
--- install). Show the button only when the binary is really there, instead of
--- offering one that silently does nothing.
-local has_traceroute = false
-do
-	for _, p in ipairs({ "/usr/bin/traceroute", "/bin/traceroute",
-	                     "/usr/sbin/traceroute", "/sbin/traceroute" }) do
-		if fs.access(p) then has_traceroute = true break end
-	end
-end
-
-if has_traceroute then
-o = s:option(Button, "_pick_probe", translate("Pick the probe target"))
-o.inputtitle = translate("Pick the closest hop automatically")
-o.inputstyle = "reload"
-o.description = translate("Runs one traceroute and uses the nearest hop that also answers a " ..
-	"plain ping as the latency target. A hop inside your ISP shows your own access link's " ..
-	"queue instead of the far end of the internet.")
-o.write = function()
-	require("luci.sys").call("/etc/init.d/prio pickprobe >/dev/null 2>&1")
-end
-else
-o = s:option(DummyValue, "_pick_probe_off", translate("Pick the probe target"))
-o.cfgvalue = function()
-	return translate("automatic pick unavailable: traceroute is not installed")
-end
-o.description = translate("Install traceroute, or type the address of a nearby hop yourself.")
-end
+o = s:option(Value, "shaper_kbit", translate("Downlink rate (kbit/s)"))
+o.datatype = "uinteger"
+o.placeholder = "15000"
+-- Hidden while the line is measured: the stored number is inert then, and
+-- leaving 100000 in the box next to "shaper: 338.2 Mbit/s" looks like a
+-- contradiction rather than an unused field.
+o:depends("auto_bandwidth", "0")
+o.description = translate("Only used when \"Measure the line automatically\" is off. " ..
+	"0 leaves the downlink unshaped.")
 
 o = s:option(Value, "shaper_margin", translate("Safety margin (%)"))
 o.default = 10
@@ -435,123 +394,6 @@ o.description = translate("How far below the measured capacity to run, in percen
 	"Only the measured value is reduced; a rate typed in by hand is used exactly as " ..
 	"typed. Bigger means a deeper local queue (priority bites harder) but less peak " ..
 	"throughput.")
-
-o = s:option(Value, "shaper_kbit", translate("Downlink rate (kbit/s)"))
-o.datatype = "uinteger"
-o.placeholder = "15000"
-o.description = translate("Used when auto-detection is off. 0 leaves the downlink unshaped.")
-
-o = s:option(ListValue, "bands", translate("Number of Priority Bands"))
-o.default = 3
-o:value("3", translate("3 bands (recommended)"))
-o:value("4", translate("4 bands"))
-o:value("8", translate("8 bands"))
-o.description = translate("Band 0 has the absolute highest priority. The remaining bands share bandwidth fairly.")
-
-o = s:option(ListValue, "default_band", translate("Priority for devices not in the list"))
-o.default = ""
-o.rmempty = true
-for i = 0, get_bands() - 1 do
-	o:value(tostring(i), translatef("Band %d", i))
-end
-o.description = translate("Everything that is not in the device list still goes through " ..
-	"the shaper; this is the band it gets. Empty means the lowest band, which is the " ..
-	"safe choice: a new device cannot take bandwidth away from one you configured.")
-
-o = s:option(Flag, "split_bands", translate("Separate upload priority"))
-o.default = 0
-o.rmempty = false
-o.description = translate("Off: one priority for both directions, which is what the device " ..
-	"table shows. On: every device gets a second column and can be top priority for " ..
-	"upload while staying low for download (or the other way round).")
-
-o = s:option(ListValue, "strict_bands", translate("Strict-priority levels"))
-o.default = 1
-o.rmempty = false
--- sch_ets serves the strict bands in index order and only then falls through
--- to DRR, so 2 strict bands with 3 bands really is three levels (0 > 1 > 2).
--- All bands strict is rejected: ETS needs one DRR band left over.
-for n = 1, get_bands() - 1 do
-	o:value(tostring(n), translatef("%d level(s)", n))
-end
-o.description = translate("How many bands are absolutely prioritised, taken from band 0 " ..
-	"upwards. The rest share the leftover bandwidth fairly, with no order between them. " ..
-	"With 3 bands choose 2 for a real three-level priority.")
-
--- Spell the resulting order out instead of making the reader derive it from
--- two numbers. Reads the SAVED configuration, like the other status rows, so
--- it always matches what the kernel is actually doing.
-o = s:option(DummyValue, "_hierarchy", translate("Effective order"))
-o.cfgvalue = function()
-	local b = get_bands()
-	local k = 1
-	local okk, kv = pcall(function() return uci:get("prio", "main", "strict_bands") end)
-	if okk and tonumber(kv) then k = math.floor(tonumber(kv)) end
-	if k < 1 then k = 1 end
-	if k > b - 1 then k = b - 1 end
-
-	local function lbl(i) return translate("Band") .. " " .. i end
-	local parts = {}
-	for i = 0, k - 1 do parts[#parts + 1] = lbl(i) end
-	local drr = b - k
-	if drr == 1 then
-		parts[#parts + 1] = lbl(k) .. translate(" (leftover only)")
-	elseif drr > 1 then
-		parts[#parts + 1] = lbl(k) .. "-" .. (b - 1) .. " " .. translate("share equally")
-	end
-	return table.concat(parts, " > ") .. "   ·   " ..
-		translate("kernel parameter") .. ": strict " .. k .. "/" .. b
-end
-
-o = s:option(Flag, "fq_codel", translate("Add fq_codel per band"))
-o.default = 1
-o.rmempty = false
-o.description = translate("Keeps one flow inside a band from starving the others.")
-
-o = s:option(Button, "_relearn", translate("Re-learn bandwidth"))
-o.inputtitle = translate("Forget the learned rate")
-o.inputstyle = "reload"
-o:depends("auto_bandwidth", "1")
-o.description = translate("Clears the remembered rate so the shaper measures the line again " ..
-	"from scratch. Use it after an ISP upgrade or if the learned value looks wrong.")
-o.write = function()
-	local u = require("luci.model.uci").cursor()
-	u:delete("prio", "main", "shaper_learned")
-	-- The peak is the value the detector actually reads; deleting only
-	-- shaper_learned made this button a no-op (the next window read the same
-	-- peak straight back out of the config).
-	u:delete("prio", "main", "shaper_peak")
-	-- The uplink estimate is committed at every start() too; leaving it
-	-- behind makes "forget" restore the old number on the very next reload.
-	u:delete("prio", "main", "uplink_learned")
-	-- The measured capacity is a cache of a past line; forget it too, otherwise
-	-- the next start() seeds the shaper from it and the "re-measure" promise of
-	-- this button is not kept.
-	u:delete("prio", "main", "measured_dl")
-	u:delete("prio", "main", "measured_ul")
-	u:delete("prio", "main", "measured_at")
-	u:commit("prio")
-	local fh = io.open("/var/run/luci-app-prio/shaper", "w")
-	if fh then fh:write("0\n") fh:close() end
-	-- The latency baseline is what the controller compares against; leaving
-	-- it behind makes "forget the learned rate" a no-op.
-	os.remove("/var/run/luci-app-prio/rtt_base")
-	os.remove("/var/run/luci-app-prio/up_rate")
-	os.remove("/var/run/luci-app-prio/up_cfg")
-	-- otherwise the three samples collected before the button was pressed
-	-- seed the uplink again on the next window
-	os.remove("/var/run/luci-app-prio/uptx")
-	-- "last rate that worked" memories: keeping them would make the controller
-	-- jump straight back to a rate measured on a line that no longer exists.
-	os.remove("/var/run/luci-app-prio/rate_good")
-	os.remove("/var/run/luci-app-prio/up_good")
-	-- The detector keeps its live estimate in tmpfs and start() folds it back
-	-- into the config, so leaving this file makes "forget" a no-op.
-	os.remove("/var/run/luci-app-prio/peak")
-	os.remove("/var/run/luci-app-prio/probes")
-	require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")
-end
-
 
 o = s:option(Flag, "uplink", translate("Shape Uplink (upload)"))
 o.default = 1
@@ -618,9 +460,131 @@ o.cfgvalue = function()
 	return string.format("%.1f Mbit/s", n / 1000)
 end
 
-o = s:option(Flag, "downlink", translate("Shape Downlink (download)"))
+o = s:option(Value, "rtt_target", translate("Latency probe target"))
+o.default = "223.5.5.5"
+o.datatype = "host"
+-- A private or loopback address measures the LAN, not the line: the round trip
+-- is a fraction of a millisecond, the controller sees "no congestion" and walks
+-- the rate up until the queue is back inside the modem, where priority does
+-- nothing at all. Refuse it at the source instead of silently degrading.
+o.validate = function(self, value)
+	if not value or value == "" then return value end
+	local a, b = value:match("^(%d+)%.(%d+)%.")
+	a, b = tonumber(a), tonumber(b)
+	if a == 10 or a == 127 or a == 0
+	   or (a == 192 and b == 168)
+	   or (a == 172 and b and b >= 16 and b <= 31)
+	   or (a == 169 and b == 254) then
+		return nil, translate("This is a local address: pinging it measures your " ..
+			"own network, not the line. Use a public address.")
+	end
+	return value
+end
+o.description = translate("The shaper watches the round trip to this address: while it " ..
+	"stays near the idle baseline the rate is left alone, when it climbs the rate comes " ..
+	"down. Pick a stable public address near you; an unreachable one only produces a " ..
+	"warning, because the shaper then has nothing to read.")
+
+-- The picker shells out to traceroute, which is no longer a hard dependency
+-- (the package name did not exist in the firmware feed and made apk refuse the
+-- install). Show the button only when the binary is really there, instead of
+-- offering one that silently does nothing.
+local has_traceroute = false
+do
+	for _, p in ipairs({ "/usr/bin/traceroute", "/bin/traceroute",
+	                     "/usr/sbin/traceroute", "/sbin/traceroute" }) do
+		if fs.access(p) then has_traceroute = true break end
+	end
+end
+
+if has_traceroute then
+o = s:option(Button, "_pick_probe", translate("Pick the probe target"))
+o.inputtitle = translate("Pick the closest hop automatically")
+o.inputstyle = "reload"
+o.description = translate("Runs one traceroute and uses the nearest hop that also answers a " ..
+	"plain ping as the latency target. A hop inside your ISP shows your own access link's " ..
+	"queue instead of the far end of the internet.")
+o.write = function()
+	require("luci.sys").call("/etc/init.d/prio pickprobe >/dev/null 2>&1")
+end
+else
+o = s:option(DummyValue, "_pick_probe_off", translate("Pick the probe target"))
+o.cfgvalue = function()
+	return translate("automatic pick unavailable: traceroute is not installed")
+end
+o.description = translate("Install traceroute, or type the address of a nearby hop yourself.")
+end
+
+o = s:option(ListValue, "bands", translate("Number of Priority Bands"))
+o.default = 3
+o:value("3", translate("3 bands (recommended)"))
+o:value("4", translate("4 bands"))
+o:value("8", translate("8 bands"))
+o.description = translate("Band 0 has the absolute highest priority. The remaining bands share bandwidth fairly.")
+
+o = s:option(ListValue, "default_band", translate("Priority for devices not in the list"))
+o.default = ""
+o.rmempty = true
+-- Empty must have its own entry. Without one, a ListValue renders the first
+-- choice (band 0, the HIGHEST) while the stored value is empty (the LOWEST),
+-- and the page then claims guests get top priority when they get the bottom.
+o:value("", translatef("lowest band, band %d (recommended)", get_bands() - 1))
+for i = 0, get_bands() - 1 do
+	o:value(tostring(i), translatef("Band %d", i))
+end
+o.description = translate("Everything that is not in the device list still goes through " ..
+	"the shaper; this is the band it gets. Empty means the lowest band, which is the " ..
+	"safe choice: a new device cannot take bandwidth away from one you configured.")
+
+o = s:option(Flag, "split_bands", translate("Separate upload priority"))
+o.default = 0
+o.rmempty = false
+o.description = translate("Off: one priority for both directions, which is what the device " ..
+	"table shows. On: every device gets a second column and can be top priority for " ..
+	"upload while staying low for download (or the other way round).")
+
+o = s:option(ListValue, "strict_bands", translate("Strict-priority levels"))
 o.default = 1
 o.rmempty = false
+-- sch_ets serves the strict bands in index order and only then falls through
+-- to DRR, so 2 strict bands with 3 bands really is three levels (0 > 1 > 2).
+-- All bands strict is rejected: ETS needs one DRR band left over.
+for n = 1, get_bands() - 1 do
+	o:value(tostring(n), translatef("%d level(s)", n))
+end
+o.description = translate("How many bands are absolutely prioritised, taken from band 0 " ..
+	"upwards. The rest share the leftover bandwidth fairly, with no order between them. " ..
+	"With 3 bands choose 2 for a real three-level priority.")
+
+-- Spell the resulting order out instead of making the reader derive it from
+-- two numbers. Reads the SAVED configuration, like the other status rows, so
+-- it always matches what the kernel is actually doing.
+o = s:option(DummyValue, "_hierarchy", translate("Effective order"))
+o.cfgvalue = function()
+	local b = get_bands()
+	local k = 1
+	local okk, kv = pcall(function() return uci:get("prio", "main", "strict_bands") end)
+	if okk and tonumber(kv) then k = math.floor(tonumber(kv)) end
+	if k < 1 then k = 1 end
+	if k > b - 1 then k = b - 1 end
+
+	local function lbl(i) return translate("Band") .. " " .. i end
+	local parts = {}
+	for i = 0, k - 1 do parts[#parts + 1] = lbl(i) end
+	local drr = b - k
+	if drr == 1 then
+		parts[#parts + 1] = lbl(k) .. translate(" (leftover only)")
+	elseif drr > 1 then
+		parts[#parts + 1] = lbl(k) .. "-" .. (b - 1) .. " " .. translate("share equally")
+	end
+	return table.concat(parts, " > ") .. "   ·   " ..
+		translate("kernel parameter") .. ": strict " .. k .. "/" .. b
+end
+
+o = s:option(Flag, "fq_codel", translate("Add fq_codel per band"))
+o.default = 1
+o.rmempty = false
+o.description = translate("Keeps one flow inside a band from starving the others.")
 
 o = s:option(Flag, "lan_shaping", translate("Queue LAN traffic too"))
 o.default = 0
@@ -666,6 +630,12 @@ if ok_dev and type(devs) == "table" then
 		end
 	end
 end
+
+o = s:option(Flag, "auto_hnat_off", translate("Use software flow offloading"))
+o.default = 1
+o.rmempty = false
+o.description = translate("Hardware HNAT bypasses the qdisc and would make priority useless. " ..
+	"Software flow offloading keeps packets on the qdisc path.")
 
 -- ============================================================
 -- 设备优先级列表

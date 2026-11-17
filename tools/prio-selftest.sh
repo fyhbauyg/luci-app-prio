@@ -109,8 +109,9 @@ restore_key() {
 	if [ -n "$UPL0" ]; then uci -q set prio.main.uplink_learned=$UPL0; else uci -q delete prio.main.uplink_learned; fi
 	uci -q commit prio
 }
-# N6: the "re-learn" section below deletes the downlink estimate; save it too,
-# otherwise one selftest run makes the router re-learn its download rate.
+# N6: the section below deletes the downlink estimate to test the first-boot
+# path (the same keys a manual `uci delete` removes); save it too, otherwise
+# one selftest run makes the router re-learn its download rate.
 DL0=$(uci -q get prio.main.shaper_learned)
 DP0=$(uci -q get prio.main.shaper_peak)
 restore_dl() {

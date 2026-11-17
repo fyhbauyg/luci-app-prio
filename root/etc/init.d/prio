@@ -908,7 +908,8 @@ start_detect() {
 		# Nothing ever lowers it automatically. A download from a slow server
 		# is indistinguishable from a slow line from here, so an automatic
 		# downward move would let any limping CDN throttle the whole
-		# connection. "Re-learn" and a fresh measurement are the way down.
+		# connection. A fresh measurement is the way down; with the automatic
+		# mode off it is a manual `uci set prio.main.shaper_kbit=...`.
 		# NOTE: these are seconds, and now_cs() counts centiseconds, so every
 		# use below multiplies by 100. Getting this wrong made the shaper open
 		# itself every 6 seconds, which is indistinguishable from no shaping.
@@ -1063,7 +1064,8 @@ start_detect() {
 
 			rate=$(shaper_kbit)
 			applied=$(applied_kbit "$rate")
-			# A fresh install (or right after "re-learn") has no rate: 0 flows
+			# A fresh install (or after a manual `uci delete` of the learned
+			# rate) has no rate: 0 flows
 			# through every branch and the floor turns it into 1.8 Mbit, which
 			# then needs ~50 minutes of +3% to climb back. Seed it from the
 			# traffic that is flowing right now instead.
@@ -1622,6 +1624,15 @@ measure() {
 	# and what the freshness checks read), so a failed download must not renew
 	# it -- otherwise an old value looks fresh forever.
 	[ "$dlok" = 1 ] && state_set measured_at "$(date +%s)"
+	# A fresh measurement replaces the rate, so the latency floor learned on
+	# the old path has to go with it: a stale baseline judges the new rate as
+	# congestion and cuts it for several windows before it re-learns. Truncated
+	# rather than deleted -- an empty file reads as 0, which is "not learned
+	# yet", and the loop takes a new sample from the next idle window.
+	if [ "$dlok" = 1 ]; then
+		: > "$PRIO_STATE/rtt_base"
+		: > "$PRIO_STATE/rtt_bad"
+	fi
 	# A measurement that finished after the engine was stopped must not rebuild
 	# the queue it just tore down.
 	if [ "$(state_get enabled)" != "1" ]; then
@@ -1731,9 +1742,8 @@ start() {
 		state_set uplink_learned "$uf"
 	fi
 
-	# "forget the learned rate" deletes both keys; anything left in tmpfs must
-	# not resurrect them on the next start, which is exactly what made that
-	# button look broken.
+	# Deleting the learned keys by hand (first install, or `uci delete`) must not
+	# let anything left in tmpfs resurrect them on the next start.
 	if [ -z "$(state_get shaper_learned)" ] && [ -z "$(state_get shaper_peak)" ]; then
 		: > "$PRIO_STATE/peak"
 		: > "$PRIO_STATE/probes"
