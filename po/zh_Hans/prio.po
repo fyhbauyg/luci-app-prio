@@ -369,3 +369,21 @@ msgstr "上一窗口内本地没有积压——流量一直没超过整形速率
 
 msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test under half cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
 msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。如果上一次测量至少有 5 Mbit/s，一天之内低于它一半的结果会被忽略，这样一次被限速的测速不会把速率钉死；真的降速了得等过这一天，或者关掉自动测量手动填速率。"
+
+msgid "another measurement is still running"
+msgstr "另一次测量正在运行"
+
+msgid "the line was busy, so it was skipped"
+msgstr "线路当时有流量，已跳过"
+
+msgid "nothing came back -- the line or the speedtest node was unreachable"
+msgstr "没有任何返回数据——线路或测速节点连不上"
+
+msgid "the WAN interface was missing"
+msgstr "找不到 WAN 接口"
+
+msgid "under half of the last one, so it was ignored"
+msgstr "不到上次测量的一半，已忽略"
+
+msgid "last attempt failed: %s (%s)"
+msgstr "上次测量失败：%s（%s）"

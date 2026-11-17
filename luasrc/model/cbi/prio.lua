@@ -345,20 +345,51 @@ o.cfgvalue = function()
 	local ok2, ul = pcall(function() return uci:get("prio", "main", "measured_ul") end)
 	local ok3, at = pcall(function() return uci:get("prio", "main", "measured_at") end)
 	dl, ul = num(ok1 and dl), num(ok2 and ul)
-	if dl < 1 and ul < 1 then
-		return translate("not measured yet")
-	end
-	local age = ""
 	local t0 = tonumber(ok3 and at or "") or 0
-	if t0 > 0 then
-		local d = os.time() - t0
-		if d >= 0 then
-			if d < 120 then age = translate("just now")
-			elseif d < 7200 then age = string.format(translate("%d minutes ago"), math.floor(d / 60))
-			else age = string.format(translate("%d hours ago"), math.floor(d / 3600)) end
+
+	local function ago(ts)
+		local d = os.time() - ts
+		if d < 0 then return "" end
+		if d < 120 then return translate("just now") end
+		if d < 7200 then return string.format(translate("%d minutes ago"), math.floor(d / 60)) end
+		return string.format(translate("%d hours ago"), math.floor(d / 3600))
+	end
+
+	-- Why the last attempt produced nothing. Without it a busy line, a held
+	-- lock and a dead speedtest client all look like a button that does
+	-- nothing at all. The reasons are written by measure() in the init script.
+	local note = ""
+	if fs.access("/var/run/luci-app-prio/measure_err") then
+		local ets, code = (fs.readfile("/var/run/luci-app-prio/measure_err") or ""):match("^(%d+)%s+(%S+)")
+		ets = tonumber(ets) or 0
+		-- Literal translate() calls on purpose: a table of strings translated
+		-- through a variable is invisible to the .po audit.
+		local why
+		if code == "busy" then
+			why = translate("another measurement is still running")
+		elseif code == "line-busy" then
+			why = translate("the line was busy, so it was skipped")
+		elseif code == "no-data" then
+			why = translate("nothing came back -- the line or the speedtest node was unreachable")
+		elseif code == "no-iface" then
+			why = translate("the WAN interface was missing")
+		elseif code == "rejected" then
+			why = translate("under half of the last one, so it was ignored")
+		end
+		-- Only when it is newer than the number above: a stale note next to a
+		-- fresh measurement would read like a contradiction.
+		if why and ets > t0 then
+			note = "  ·  " .. string.format(translate("last attempt failed: %s (%s)"),
+				translate(why), ago(ets))
 		end
 	end
-	return string.format("%.1f Mbit/s ↓  ·  %.1f Mbit/s ↑  ·  %s", dl / 1000, ul / 1000, age)
+
+	if dl < 1 and ul < 1 then
+		if note ~= "" then return translate("not measured yet") .. note end
+		return translate("not measured yet")
+	end
+	local age = t0 > 0 and ago(t0) or ""
+	return string.format("%.1f Mbit/s ↓  ·  %.1f Mbit/s ↑  ·  %s", dl / 1000, ul / 1000, age) .. note
 end
 
 o = s:option(Button, "_measure", translate("Measured capacity"))

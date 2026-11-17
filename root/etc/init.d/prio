@@ -53,6 +53,17 @@ UNMARK_MASK=0xff00ffff
 state_get() { uci -q get "prio.main.$1"; }
 state_set() { uci -q set "prio.main.$1=$2" && uci -q commit prio; }
 
+# A measurement can end without changing anything -- the line was busy, another
+# run held the lock, the speedtest client answered nothing. Silently leaving the
+# old numbers in place makes the button look dead, so the reason is recorded
+# here and the page reports it next to the last measurement.
+mea_fail() {
+	printf '%s %s\n' "$(date +%s)" "$1" > "$PRIO_STATE/measure_err" 2>/dev/null
+}
+mea_ok() {
+	: > "$PRIO_STATE/measure_err" 2>/dev/null
+}
+
 # Serialises start/stop so overlapping reloads (double-click on save, two
 # browser tabs, a save racing a disable) cannot interleave nft/tc changes and
 # leave a half-configured engine. Re-entrant so reload() can call start().
@@ -1451,7 +1462,7 @@ measure() {
 	method="$(state_get measure_method)"
 	[ -n "$method" ] || method=auto
 
-	[ -e "/sys/class/net/$dev/statistics/rx_bytes" ] || { echo "measure:no-iface"; return 1; }
+	[ -e "/sys/class/net/$dev/statistics/rx_bytes" ] || { echo "measure:no-iface"; mea_fail no-iface; return 1; }
 
 	# Two measurements at once would each see the other's traffic; the marker
 	# also tells the detector to ignore its window. It is cleaned by a trap:
@@ -1462,7 +1473,7 @@ measure() {
 		local mage
 		mage=$(( $(date +%s) - $(date -r "$PRIO_STATE/measuring" +%s 2>/dev/null || echo 0) ))
 		# a marker older than this cannot belong to a live measurement
-		[ "$mage" -gt 120 ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; return 1; }
+		[ "$mage" -gt 120 ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; mea_fail busy; return 1; }
 	fi
 	: > "$PRIO_STATE/measuring"
 	trap 'rm -f "$PRIO_STATE/measuring"; : > /tmp/.prio-measure-up 2>/dev/null; : > /tmp/.prio-cnspeed.json 2>/dev/null' EXIT INT TERM
@@ -1480,6 +1491,7 @@ measure() {
 		if [ $(( (i1 - i0) * 8 / 2 / 1000 )) -gt 2000 ]; then
 			echo "measure:busy"
 			logger -t luci-app-prio "measurement skipped: link is busy"
+			mea_fail line-busy
 			return 1
 		fi
 		;;
@@ -1588,12 +1600,14 @@ measure() {
 		logger -t luci-app-prio "measurement ${dl}kbit is under half of ${prev_dl}kbit, ignored"
 		dl=$prev_dl
 		guard_reject=1
+		mea_fail rejected
 	fi
 	dlok=0; ulok=0
 	[ "$dl" -ge 1000 ] && dlok=1
 	[ "$ul" -ge 1000 ] && ulok=1
 	if [ "$dlok" = 0 ] && [ "$ulok" = 0 ]; then
 		logger -t luci-app-prio "measurement failed (down ${dl} up ${ul} kbit)"
+		mea_fail no-data
 		return 1
 	fi
 	[ "$dlok" = 1 ] || dl="$(state_get measured_dl)"
@@ -1603,12 +1617,17 @@ measure() {
 		# store the numbers even without the lock; the next start() will use them
 		state_set measured_dl "$dl"
 		state_set measured_ul "$ul"
-		# Same rule as below: a result the guard rejected must not look fresh.
+		# Same rules as below: a rejected result must not look fresh, and a
+		# stored one clears the previous failure note.
 		[ "$guard_reject" = 1 ] || state_set measured_at "$(date +%s)"
+		[ "$guard_reject" = 1 ] || mea_ok
 		return 0
 	}
 	state_set measured_dl "$dl"
 	state_set measured_ul "$ul"
+	# A stored number clears the previous failure note; a rejected one keeps it,
+	# because nothing was learned and the page should still say why.
+	[ "$guard_reject" = 1 ] || mea_ok
 	# The timestamp describes the DOWNLOAD number (that is what the shaper uses
 	# and what the freshness checks read), so a failed download must not renew
 	# it -- otherwise an old value looks fresh forever.
