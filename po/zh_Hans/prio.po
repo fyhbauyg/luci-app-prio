@@ -37,9 +37,6 @@ msgstr "8 个带"
 msgid "Acceleration mode"
 msgstr "加速模式"
 
-msgid "Add fq_codel per band"
-msgstr "每个带内加 fq_codel"
-
 msgid "Attention"
 msgstr "注意"
 
@@ -120,9 +117,6 @@ msgstr "工作原理"
 
 msgid "How many bands are absolutely prioritised, taken from band 0 upwards. The rest share the leftover bandwidth fairly, with no order between them. With 3 bands choose 2 for a real three-level priority."
 msgstr "有几个带享有绝对优先，从带 0 开始按序生效；其余带公平分享剩余带宽、彼此不分先后。三条带时选 2 即可得到真正的三级优先级。"
-
-msgid "Keeps one flow inside a band from starving the others."
-msgstr "防止同一个带内单条流把其他流饿死。"
 
 msgid "LAN Interface"
 msgstr "LAN 接口"
@@ -396,3 +390,9 @@ msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里
 
 msgid "the priority engine is switched off"
 msgstr "优先级引擎已关闭"
+
+msgid "Fair queueing inside each band (fq_codel)"
+msgstr "每个带内按流公平排队（fq_codel）"
+
+msgid "Ticked: fq_codel queues every flow separately with a 3 ms target, so while a band is being served its flows see only a few milliseconds of queueing. That is per flow, not per host: a downloader with many connections still takes many shares. Cleared: a band is one bounded first-in-first-out queue (about 200 ms at 60 Mbit), so a device that keeps it full owns the band and the others wait behind it -- dog-eat-dog. Either way only the inside of a band changes: the ETS priority between bands is untouched, a busy higher strict band (band 0 by default) holds the lower bands back for as long as it stays busy, and the non-strict bands share whatever the strict ones leave."
+msgstr "勾选：fq_codel 按流分开排队、目标延迟 3ms，所以一条带在被服务时，它的各个流只看到几毫秒的排队。注意这是按流而不是按设备公平：开很多连接的下载器仍然会拿走很多份额。取消勾选：一条带就是一条有上限的先进先出队列（60 Mbit 下约 200ms），谁把它灌满谁就独占这条带，其他设备在后面干等——弱肉强食。两种模式都只改变一条带内部的行为：带与带之间的 ETS 优先级不受影响；上层严格带（默认只有带 0）只要还在忙，下面的带就会一直被压着；非严格带只分享严格带剩下的带宽。"

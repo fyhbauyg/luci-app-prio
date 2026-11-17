@@ -676,10 +676,17 @@ o.cfgvalue = function()
 		translate("kernel parameter") .. ": strict " .. k .. "/" .. b
 end
 
-o = s:option(Flag, "fq_codel", translate("Add fq_codel per band"))
+o = s:option(Flag, "fq_codel", translate("Fair queueing inside each band (fq_codel)"))
 o.default = 1
 o.rmempty = false
-o.description = translate("Keeps one flow inside a band from starving the others.")
+o.description = translate("Ticked: fq_codel queues every flow separately with a 3 ms target, " ..
+	"so while a band is being served its flows see only a few milliseconds of queueing. That " ..
+	"is per flow, not per host: a downloader with many connections still takes many shares. " ..
+	"Cleared: a band is one bounded first-in-first-out queue (about 200 ms at 60 Mbit), so a " ..
+	"device that keeps it full owns the band and the others wait behind it -- dog-eat-dog. " ..
+	"Either way only the inside of a band changes: the ETS priority between bands is " ..
+	"untouched, a busy higher strict band (band 0 by default) holds the lower bands back for " ..
+	"as long as it stays busy, and the non-strict bands share whatever the strict ones leave.")
 
 o = s:option(Flag, "lan_shaping", translate("Queue LAN traffic too"))
 o.default = 0
