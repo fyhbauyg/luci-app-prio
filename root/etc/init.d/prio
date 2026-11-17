@@ -802,7 +802,11 @@ rtt_all_ms() {
 	target="$(state_get rtt_target)"
 	[ -n "$target" ] || target=223.5.5.5
 	out="$(ping -c 4 -W 1 "$target" 2>/dev/null)"
-	tx="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9]*\) packets transmitted.*/\1/p')"
+	# No leading space: busybox and iputils both print "4 packets transmitted"
+	# at the start of the line, so the old '.* ' pattern never matched and this
+	# function returned 0 every single time -- which silently disabled uplink
+	# seeding from r65 on.
+	tx="$(printf '%s\n' "$out" | sed -n 's/.*\([0-9][0-9]*\) packets transmitted.*/\1/p')"
 	# busybox prints "4 packets received", iputils prints "4 received"
 	rx="$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9][0-9]*\) packets received.*/\1/p')"
 	[ -n "$rx" ] || rx="$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9][0-9]*\) received.*/\1/p')"
@@ -1093,6 +1097,8 @@ start_detect() {
 			[ "$thr_up" -le 1500 ] && upmiss=0
 			if [ "$up" -ge 1000 ] && [ "$thr_up" -gt 1500 ] && [ "$manual_up" -lt 1000 ]; then
 				urtt=$(rtt_avg_ms)
+				base=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
+				case "$base" in ''|*[!0-9]*) base=0 ;; esac
 				case "$urtt" in ''|*[!0-9]*) urtt=0 ;; esac
 				# Same protection as the downlink: three windows in a row with
 				# no answer at all mean the probe target is unusable (wrong
@@ -1110,47 +1116,26 @@ start_detect() {
 						echo "probe:down" >> "$PRIO_STATE/status"
 				fi
 				if [ "$upmiss" -lt 3 ]; then
-					# Same "is the shaper the bottleneck" gate as the downlink:
-					# a trickle of upload against a 16 Mbit cap must not raise
-					# anything, or the cap climbs to the 200 Mbit ceiling and
-					# stops meaning anything.
+					# Knee model, same as the downlink: raise while the round
+					# trip is only cell jitter, cut when the queue appears
+					# somewhere, hold in between. Cuts are never gated on
+					# anything, so a capacity drop always comes back down.
+					newup=$up
 					ubind=0
 					if [ $(( thr_up * 100 )) -ge $(( up * 80 )) ]; then
 						ubind=1
 					fi
-					ulm=$(cat "$PRIO_STATE/rttload_up" 2>/dev/null)
-					case "$ulm" in ''|*[!0-9]*) ulm=0 ;; esac
-					if [ "$ubind" = 1 ] && [ "$urtt" -gt 0 ]; then
-						if [ "$ulm" -eq 0 ] || [ "$urtt" -lt "$ulm" ]; then
-							ulm=$urtt
-						elif [ "$urtt" -gt $(( ulm + 60 )) ]; then
-							ulmbad=$(cat "$PRIO_STATE/rttload_up_bad" 2>/dev/null)
-							case "$ulmbad" in ''|*[!0-9]*) ulmbad=0 ;; esac
-							ulmbad=$(( ulmbad + 1 ))
-							if [ "$ulmbad" -ge 3 ]; then
-								ulm=$urtt
-								ulmbad=0
-							fi
-							printf '%s\n' "$ulmbad" > "$PRIO_STATE/rttload_up_bad"
-						fi
-						printf '%s\n' "$ulm" > "$PRIO_STATE/rttload_up"
-					fi
-					ulthr=$(( ulm / 5 ))
-					[ "$ulthr" -lt 15 ] && ulthr=15
-					newup=$up
 					ug=$(cat "$PRIO_STATE/up_good" 2>/dev/null)
 					case "$ug" in ''|*[!0-9]*) ug=0 ;; esac
-					if [ "$ubind" != 1 ]; then
-						: # upload not saturating the cap: hold
-					elif [ "$urtt" -eq 0 ]; then
+					if [ "$urtt" -eq 0 ]; then
 						newup=$(( up * 85 / 100 ))
-					elif [ "$ulm" -gt 0 ] && [ "$urtt" -gt $(( ulm + 80 )) ]; then
+					elif [ "$base" -gt 0 ] && [ "$urtt" -gt $(( base + 300 )) ]; then
 						# same bounds as the downlink: at least -15%, at most -30%
-						newup=$(( up * (ulm + 40) / urtt ))
+						newup=$(( up * (base + 40) / urtt ))
 						[ "$newup" -gt $(( up * 85 / 100 )) ] && newup=$(( up * 85 / 100 ))
 						[ "$newup" -lt $(( up * 70 / 100 )) ] && newup=$(( up * 70 / 100 ))
 						[ "$ug" -gt "$up" ] && printf '%s\n' "$up" > "$PRIO_STATE/up_good"
-					elif [ "$ulm" -gt 0 ] && [ "$urtt" -le $(( ulm + ulthr )) ]; then
+					elif [ "$ubind" = 1 ] && [ "$base" -gt 0 ] && [ "$urtt" -le $(( base + 150 )) ]; then
 						if [ "$up" -gt "$ug" ]; then
 							ug=$up
 							printf '%s\n' "$ug" > "$PRIO_STATE/up_good"
@@ -1167,7 +1152,7 @@ start_detect() {
 					if [ "$newup" -ne "$up" ]; then
 						if apply_uplink_rate "$dev" "$newup"; then
 							set_up_rate "$newup"
-							logger -t luci-app-prio "uplink ${up} -> ${newup}kbit (rtt ${urtt}ms, idle ${ubase}ms)"
+							logger -t luci-app-prio "uplink ${up} -> ${newup}kbit (rtt ${urtt}ms, idle ${base}ms)"
 						fi
 					fi
 				fi
@@ -1212,60 +1197,47 @@ start_detect() {
 				continue
 			fi
 			newrate=$rate
-			# Is the shaper actually the bottleneck this window? Only then does
-			# the round trip tell us anything about the line. With 3 Mbit of
-			# video flowing through a 144 Mbit cap there is no local queue, the
-			# latency equals the idle baseline, and a controller that looks only
-			# at latency climbs until the cap means nothing -- measured on this
-			# build: 6000 -> 950000 kbit during 15 minutes of light use, i.e.
-			# shaping silently switched off.
+			# Two thresholds, a wide band between them, and no "is the shaper
+			# the bottleneck" gate:
+			#  * below knee_lo the round trip is the cell's normal jitter,
+			#    whatever the rate, so raising is safe;
+			#  * above knee_hi the queue is somewhere (ours or the modem's),
+			#    so cutting is right -- and a cut must never be gated on
+			#    anything, or a capacity drop freezes the rate above capacity;
+			#  * in between, hold. That band is below the queueing regime
+			#    (measured here: jitter 34-94 ms, modem queue 300-1000 ms), so
+			#    holding in it costs almost nothing.
+			# A "binding" test was tried and rejected: with the real capacity
+			# below the applied rate the measured throughput can never reach
+			# 80% of it, so the gate stayed closed and the rate never came down.
+			# "Is the shaper limiting this window" gates the RAISE only. It is
+			# the right question for a raise (with 3 Mbit flowing through a
+			# 144 Mbit cap there is no local queue, the latency is just cell
+			# jitter, and raising would walk the cap to the ceiling without
+			# ever shaping anything). It is the wrong question for a cut: when
+			# the real capacity drops below the applied rate the measured
+			# throughput can never reach 80% of it, so gating the cut on the
+			# same test freezes the rate above capacity forever.
 			bind=0
 			if [ "$applied" -ge 1000 ] && [ $(( thr * 100 )) -ge $(( applied * 80 )) ]; then
 				bind=1
 			fi
-			# Loaded floor: the best round trip seen while this shaper WAS the
-			# bottleneck. Comparing against the idle minimum put the raise
-			# threshold inside the normal loaded jitter, so most windows fell in
-			# a dead zone and the rate crawled upward at 15% of the windows.
-			lm=$(cat "$PRIO_STATE/rttload" 2>/dev/null)
-			case "$lm" in ''|*[!0-9]*) lm=0 ;; esac
-			if [ "$bind" = 1 ] && [ "$rtt" -gt 0 ]; then
-				if [ "$lm" -eq 0 ] || [ "$rtt" -lt "$lm" ]; then
-					lm=$rtt
-				elif [ "$rtt" -gt $(( lm + 60 )) ]; then
-					# the path itself got slower (new cell, new route); a floor
-					# that can only fall would judge every window congested
-					lmbad=$(cat "$PRIO_STATE/rttload_bad" 2>/dev/null)
-					case "$lmbad" in ''|*[!0-9]*) lmbad=0 ;; esac
-					lmbad=$(( lmbad + 1 ))
-					if [ "$lmbad" -ge 3 ]; then
-						lm=$rtt
-						lmbad=0
-					fi
-					printf '%s\n' "$lmbad" > "$PRIO_STATE/rttload_bad"
-				fi
-				printf '%s\n' "$lm" > "$PRIO_STATE/rttload"
-			fi
-			lthr=$(( lm / 5 ))
-			[ "$lthr" -lt 15 ] && lthr=15
 			rg=$(cat "$PRIO_STATE/rate_good" 2>/dev/null)
 			case "$rg" in ''|*[!0-9]*) rg=0 ;; esac
-			if [ "$bind" != 1 ]; then
-				: # cap not binding: this window says nothing, hold the rate
-			elif [ "$rtt" -eq 0 ]; then
+			if [ "$rtt" -eq 0 ]; then
 				newrate=$(( rate * 80 / 100 ))
-			elif [ "$lm" -gt 0 ] && [ "$rtt" -gt $(( lm + 80 )) ]; then
+			elif [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 300 )) ]; then
 				# Proportional, but bounded on both sides: at least -15% and at
 				# most -30% in one window. The old unbounded ratio turned one
 				# 188 ms sample into a 71% cut.
-				newrate=$(( rate * (lm + 40) / rtt ))
+				newrate=$(( rate * (base + 40) / rtt ))
 				[ "$newrate" -gt $(( rate * 85 / 100 )) ] && newrate=$(( rate * 85 / 100 ))
 				[ "$newrate" -lt $(( rate * 70 / 100 )) ] && newrate=$(( rate * 70 / 100 ))
 				# The rate that just failed is the ceiling for the memory: it
 				# used to be decayed to 1.5x of the PRE-cut rate, which stopped
 				# falling after the first cut and left a stale high value.
 				[ "$rg" -gt "$rate" ] && printf '%s\n' "$rate" > "$PRIO_STATE/rate_good"
-			elif [ "$lm" -gt 0 ] && [ "$rtt" -le $(( lm + lthr )) ]; then
+			elif [ "$bind" = 1 ] && [ "$base" -gt 0 ] && [ "$rtt" -le $(( base + 150 )) ]; then
 				if [ "$rate" -gt "$rg" ]; then
 					rg=$rate
 					printf '%s\n' "$rg" > "$PRIO_STATE/rate_good"
@@ -1702,10 +1674,6 @@ start() {
 		# make the new one look permanently congested.
 		: > "$PRIO_STATE/rate_good"
 		: > "$PRIO_STATE/up_good"
-		: > "$PRIO_STATE/rttload"
-		: > "$PRIO_STATE/rttload_up"
-		: > "$PRIO_STATE/rttload_bad"
-		: > "$PRIO_STATE/rttload_up_bad"
 	fi
 
 	# The uplink and downlink hooks must be on different interfaces.
@@ -1761,8 +1729,11 @@ start() {
 	# 3. uplink
 	if [ "$uplink" = 1 ]; then
 		setup_uplink "$dev" "$bands"
-	elif qdisc_is_ours "$dev"; then
-		tc qdisc del dev "$dev" root 2>/dev/null
+	else
+		# nothing shapes the upload any more, so the page must not keep showing
+		# the last rate it had
+		: > "$PRIO_STATE/upshaper" 2>/dev/null
+		qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
 	fi
 
 	# 4. downlink
@@ -1808,6 +1779,7 @@ stop() {
 		uci -q commit prio
 	fi
 
+	: > "$PRIO_STATE/upshaper" 2>/dev/null
 	# Keep $PRIO_STATE/shaper: reload() must not throw away the learned rate.
 	# Same for the uplink: a clean shutdown should not cost the last rate the
 	# loop found, otherwise every reboot restarts the upload at "open".

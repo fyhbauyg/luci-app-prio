@@ -539,12 +539,6 @@ o.write = function()
 	-- jump straight back to a rate measured on a line that no longer exists.
 	os.remove("/var/run/luci-app-prio/rate_good")
 	os.remove("/var/run/luci-app-prio/up_good")
-	-- The loaded-latency floors are what the controller compares against while
-	-- the shaper is the bottleneck; keeping them makes "forget" a no-op.
-	os.remove("/var/run/luci-app-prio/rttload")
-	os.remove("/var/run/luci-app-prio/rttload_up")
-	os.remove("/var/run/luci-app-prio/rttload_bad")
-	os.remove("/var/run/luci-app-prio/rttload_up_bad")
 	-- The detector keeps its live estimate in tmpfs and start() folds it back
 	-- into the config, so leaving this file makes "forget" a no-op.
 	os.remove("/var/run/luci-app-prio/peak")

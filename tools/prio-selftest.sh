@@ -101,7 +101,17 @@ restore_key() {
 	if [ -n "$UPL0" ]; then uci -q set prio.main.uplink_learned=$UPL0; else uci -q delete prio.main.uplink_learned; fi
 	uci -q commit prio
 }
-trap 'restore_up' EXIT INT TERM
+# N6: the "re-learn" section below deletes the downlink estimate; save it too,
+# otherwise one selftest run makes the router re-learn its download rate.
+DL0=$(uci -q get prio.main.shaper_learned)
+DP0=$(uci -q get prio.main.shaper_peak)
+restore_dl() {
+	if [ -n "$DL0" ]; then uci -q set prio.main.shaper_learned=$DL0; else uci -q delete prio.main.shaper_learned; fi
+	if [ -n "$DP0" ]; then uci -q set prio.main.shaper_peak=$DP0; else uci -q delete prio.main.shaper_peak; fi
+	uci -q commit prio
+}
+trap 'restore_up; restore_dl; exit 130' INT TERM
+trap 'restore_up; restore_dl' EXIT
 
 uci -q set prio.main.uplink_learned=12345
 uci -q set prio.main.uplink_kbit=0
@@ -178,6 +188,8 @@ chk "校准中止信息是中文且明确" "grep -q '没检测到下载流量\|�
 uci -q delete prio.main.shaper_peak; uci -q delete prio.main.shaper_learned; uci -q commit prio
 /etc/init.d/prio reload >/dev/null 2>&1; sleep 3
 if [ -s $ST/peak ]; then no "重新学习没有清空 tmpfs 峰值"; else ok "重新学习清空了峰值"; fi
+# put the user's download estimate back (the trap repeats this on a hard exit)
+restore_dl
 
 # 10. 关/开 循环后仍可用
 /etc/init.d/prio stop >/dev/null 2>&1; sleep 2
