@@ -1,0 +1,13 @@
+{
+	"admin/network/prio": {
+		"title": "Device Priority",
+		"order": 60,
+		"action": {
+			"type": "cbi",
+			"path": "prio"
+		},
+		"depends": {
+			"acl": [ "luci-app-prio" ]
+		}
+	}
+}

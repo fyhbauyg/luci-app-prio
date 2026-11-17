@@ -1,0 +1,1605 @@
+#!/bin/sh /etc/rc.common
+# luci-app-prio v5 - per-device network priority
+# Copyright (C) 2026 congge
+#
+# Architecture (verified on hardware):
+#
+#   upload  : LAN client -> router -> eth2 egress       (ETS + fwmark)
+#   download: internet -> eth2 -> DNAT -> route -> br-lan egress (tbf -> ETS + fwmark)
+#
+# Marking (netfilter, before/after NAT):
+#   pre  chain (priority mangle - 10): ip saddr @sN -> mark  (upload)
+#   post chain (priority dstnat + 10): ip daddr @sN -> mark  (download)
+#
+# Mark space: bits 16..23 (0x010000 .. 0x800000), private to this package.
+#   mwan3 uses 0x100/0x3f00, passwall/openclash use low bits, so nothing collides.
+#   Marks are OR-ed in, never written as a whole word, to preserve other modules.
+#
+# Downlink hierarchy:
+#   root tbf (rate = learned WAN rate, creates the backlog)
+#     class 10:1
+#       ets bands N strict K  (priority; K = strict_bands, 1..N-1)
+#         1:1..1:N fq_codel   (per-band fairness)
+#
+# Why not ifb: the ifb egress qdisc runs before netfilter PREROUTING, so the
+# fwmark is not set yet. br-lan egress runs after routing, where it is.
+#
+# Note: only the first `strict_bands` bands are strict priority, and ETS serves
+# them in index order. The remaining bands share bandwidth via DRR with equal
+# quanta -- they are NOT ordered relative to each other. With 3 bands, setting
+# strict_bands=2 gives three real levels (0 > 1 > 2); the default of 1 gives
+# band 0 plus two equal bands.
+
+START=99
+STOP=10
+# Without this, rc.common rejects `status` and prints its usage text, so every
+# caller (LuCI included) sees the service as dead even while it is running.
+EXTRA_COMMANDS="status reload apply calibrate pickprobe"
+EXTRA_HELP="	status	Show whether the priority engine is running
+	reload	Re-apply the configuration
+	apply <0|1>	Re-apply and wait until the committed switch matches <0|1>
+	calibrate	Sweep the shaping rate during a download and record the latency
+	pickprobe	Trace the route and pick the closest answering hop as probe target"
+
+PRIO_STATE=/var/run/luci-app-prio
+DETECT_PID="$PRIO_STATE/detect.pid"
+HNAT_TOGGLE=/sys/kernel/debug/hnat/hook_toggle
+EFFECTIVE_STATE=/var/run/c2000max-hnat-effective
+NFT_TABLE="inet luci_prio"
+MARK_BASE=0x010000
+MARK_MASK=0x00ff0000
+TBF_HANDLE=10
+UNMARK_MASK=0xff00ffff
+
+state_get() { uci -q get "prio.main.$1"; }
+state_set() { uci -q set "prio.main.$1=$2" && uci -q commit prio; }
+
+# Serialises start/stop so overlapping reloads (double-click on save, two
+# browser tabs, a save racing a disable) cannot interleave nft/tc changes and
+# leave a half-configured engine. Re-entrant so reload() can call start().
+PRIO_LOCK="$PRIO_STATE/lock"
+LOCK_HELD=0
+
+acquire_lock() {
+	[ "$LOCK_HELD" = 1 ] && return 0
+	mkdir -p "$PRIO_STATE" 2>/dev/null
+	local i=0 owner
+	while ! mkdir "$PRIO_LOCK" 2>/dev/null; do
+		# Reclaim a lock whose owner died (Ctrl-C, SIGTERM, watchdog). Without
+		# this a single interrupted start would block every later reload until
+		# the router reboots.
+		owner="$(cat "$PRIO_LOCK/pid" 2>/dev/null)"
+		if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+			rm -rf "$PRIO_LOCK" 2>/dev/null
+			continue
+		fi
+		i=$((i + 1))
+		if [ "$i" -ge 30 ]; then
+			echo "lock:timeout" >> "$PRIO_STATE/err"
+			logger -t luci-app-prio "could not acquire lock, giving up"
+			return 1
+		fi
+		sleep 1
+	done
+	printf '%s\n' "$$" > "$PRIO_LOCK/pid" 2>/dev/null
+	trap 'release_lock' EXIT INT TERM HUP
+	LOCK_HELD=1
+	return 0
+}
+
+release_lock() {
+	[ "$LOCK_HELD" = 1 ] || return 0
+	rm -f "$PRIO_LOCK/pid" 2>/dev/null
+	rmdir "$PRIO_LOCK" 2>/dev/null
+	LOCK_HELD=0
+}
+
+# How many leading bands are strict priority. sch_ets serves the strict bands
+# in index order and only then falls through to DRR for the rest, so
+# strict=2 with 3 bands really is three levels: 0 > 1 > 2.
+# A value of N (all bands strict) leaves no DRR band and is rejected here.
+strict_count() {
+	local bands="$1" v max
+	v="$(state_get strict_bands)"
+	case "$v" in ''|*[!0-9]*) v=1 ;; esac
+	max=$((bands - 1))
+	[ "$max" -lt 1 ] && max=1
+	[ "$v" -gt "$max" ] && v="$max"
+	[ "$v" -lt 1 ] && v=1
+	echo "$v"
+}
+
+band_mark() {
+	local b="$1"
+	case "$b" in 0|1|2|3|4|5|6|7) ;; *) b=0 ;; esac
+	echo $((MARK_BASE << b))
+}
+
+qdisc_is_ours() {
+	tc qdisc show dev "$1" 2>/dev/null | grep -qE 'qdisc htb 1: root|qdisc ets 2: root|qdisc tbf 10: root|qdisc ets 1: root'
+}
+
+wait_hnat_down() {
+	local i=0
+	while [ "$i" -lt 25 ]; do
+		[ "$(cat "$HNAT_TOGGLE" 2>/dev/null)" = "disabled" ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+shaper_kbit() {
+	local r
+	r="$(cat "$PRIO_STATE/shaper" 2>/dev/null)"
+	case "$r" in ''|*[!0-9]*) r='' ;; esac
+	# /var/run is a tmpfs, so the learned rate disappears on reboot. Keep a
+	# committed copy too, otherwise every boot restarts from zero and the
+	# value depends on whatever the first burst after boot happens to be.
+	if [ -z "$r" ] && [ "$(state_get auto_bandwidth)" = "1" ]; then
+		r="$(state_get shaper_learned)"
+		case "$r" in ''|*[!0-9]*) r='' ;; esac
+	fi
+	# The manual value is ONLY authoritative when auto-detection is off. Using
+	# it as a seed while auto is on would silently start the learner from a
+	# number the user was told would be ignored.
+	if [ -z "$r" ] && [ "$(state_get auto_bandwidth)" != "1" ]; then
+		r="$(state_get shaper_kbit)"
+	fi
+	case "$r" in ''|*[!0-9]*) r=0 ;; esac
+	[ "$r" -ge 1000 ] 2>/dev/null || r=0
+	echo "$r"
+}
+
+# Safety margin. The learned value is the line's estimated capacity; the rate
+# actually handed to tc is that estimate reduced by this percentage. Shaping
+# *below* the real capacity is what keeps the backlog in our qdisc instead of
+# the ISP's buffer -- with no local queue there is nothing for the priority
+# scheduler to reorder, which is why priority used to "wake up late".
+margin_pct() {
+	local m
+	m="$(state_get shaper_margin)"
+	case "$m" in ''|*[!0-9]*) m=10 ;; esac
+	[ "$m" -gt 50 ] && m=50
+	echo "$m"
+}
+
+applied_kbit() {
+	local est="$1" m
+	case "$est" in ''|*[!0-9]*) est=0 ;; esac
+	# A manually entered rate is a number the user asked for and must be used
+	# verbatim. Only the learned estimate is hedged with a safety margin,
+	# because only that one is a guess.
+	if [ "$(state_get auto_bandwidth)" != "1" ]; then
+		echo "$est"
+		return 0
+	fi
+	m="$(margin_pct)"
+	echo $(( est * (100 - m) / 100 ))
+}
+
+# Rate for the LAN class. 0 in the config means "detect": the highest link
+# speed reported by the bridge members, falling back to 1 Gbit/s (the usual
+# wired port on this box). Shaping the LAN at its real link speed builds a
+# queue without capping throughput below what the wire can do.
+lan_rate_kbit() {
+	local lan="$1" r
+	r="$(state_get lan_rate_kbit)"
+	case "$r" in ''|*[!0-9]*) r=0 ;; esac
+	if [ "$r" -ge 1000 ]; then
+		echo "$r"
+		return
+	fi
+
+	local best=0 s m
+	for m in /sys/class/net/"$lan"/brif/*; do
+		[ -e "$m" ] || continue
+		# WiFi members either have no speed file or report a signalling rate
+		# far above the wired line rate; using it would make the class too fast
+		# to ever form a queue.
+		[ -e "$m/wireless" ] && continue
+		[ "$(cat "$m/operstate" 2>/dev/null)" = "up" ] || continue
+		s=$(cat "$m/speed" 2>/dev/null)
+		case "$s" in ''|*[!0-9]*) continue ;; esac
+		[ "$s" -gt "$best" ] && best=$s
+	done
+	if [ "$best" -eq 0 ]; then
+		s=$(cat "/sys/class/net/$lan/speed" 2>/dev/null)
+		case "$s" in ''|*[!0-9]*) s=0 ;; esac
+		best=$s
+	fi
+	# Unknown link speed must NOT become a guess that could throttle a faster
+	# port: use a value above any realistic LAN so the class never limits.
+	[ "$best" -gt 0 ] || best=10000
+	echo $((best * 1000))
+}
+
+# ---------------- nft marking ----------------
+# Resolve one configured IPv4 address to the client's MAC. Everything IPv6
+# hangs off this: a Windows/Android client rotates its privacy address every
+# few hours, so the address in UCI is only a stable handle on the *device*.
+# The MAC is what actually identifies it, and it is what the neighbour table
+# lets us map back to whatever address the client is using right now.
+mac_for_ip() {
+	local ip="$1" mac
+	mac="$(ip neigh show "$ip" 2>/dev/null | grep -o 'lladdr [0-9a-f:]*' | head -n1 | cut -d' ' -f2)"
+	[ -n "$mac" ] || mac="$(ip -6 neigh show to "$ip" 2>/dev/null | grep -o 'lladdr [0-9a-f:]*' | head -n1 | cut -d' ' -f2)"
+	[ -n "$mac" ] || mac="$(awk -v ip="$ip" '$3==ip && NF>=3 {print $2}' /tmp/dhcp.leases 2>/dev/null | head -n1)"
+	case "$mac" in
+		*:*) echo "$mac" ;;
+		*) : ;;
+	esac
+}
+
+# Looks up the band a MAC was registered with. Empty when unknown.
+band_for_mac() {
+	awk -v mac="$1" '$1==mac {print $2; exit}' "$PRIO_STATE/macmap" 2>/dev/null
+}
+
+# True when the address is already in the set for that band, so the periodic
+# refresh does not re-add (and re-log) the same elements every tick.
+addr_known() {
+	grep -qxF "$1 $2" "$PRIO_STATE/addrseen" 2>/dev/null
+}
+
+addr_remember() {
+	printf '%s %s\n' "$1" "$2" >> "$PRIO_STATE/addrseen"
+}
+
+prio_nft_device() {
+	local section="$1"
+	local enabled ip band
+	config_get_bool enabled "$section" enabled 1
+	[ "$enabled" = 1 ] || return 0
+	config_get ip "$section" ip
+	config_get band "$section" band 0
+	[ -n "$ip" ] || return 0
+	# A stale or mistyped band must never grant top priority. Non-numeric and
+	# out-of-range values both clamp DOWN to the lowest band.
+	case "$band" in
+		''|*[!0-9]*)
+			echo "band:invalid:${ip}:'${band}'" >> "$PRIO_STATE/err"
+			band="$PRIO_BANDS_MAX"
+			;;
+	esac
+	if [ "$band" -gt "$PRIO_BANDS_MAX" ] 2>/dev/null; then
+		echo "band:clamped:${ip}:${band}" >> "$PRIO_STATE/err"
+		band="$PRIO_BANDS_MAX"
+	fi
+
+	# dedupe: one IP must only live in one band
+	if grep -q "^${ip} " "$PRIO_STATE/ipmap" 2>/dev/null; then
+		echo "dup:${ip}" >> "$PRIO_STATE/err"
+		return 0
+	fi
+
+	if nft add element "$NFT_TABLE" "s${band}" "{ $ip }" 2>>"$PRIO_STATE/err"; then
+		printf '%s %s\n' "$ip" "$band" >> "$PRIO_STATE/ipmap"
+		# Remember the device identity for the IPv6 side. A failed lookup is
+		# not fatal: IPv4 keeps working and the refresh loop retries later.
+		local mac
+		mac="$(mac_for_ip "$ip")"
+		if [ -n "$mac" ]; then
+			if ! grep -q "^${mac} " "$PRIO_STATE/macmap" 2>/dev/null; then
+				printf '%s %s\n' "$mac" "$band" >> "$PRIO_STATE/macmap"
+			fi
+		else
+			echo "mac:unknown:${ip}" >> "$PRIO_STATE/err"
+		fi
+	else
+		echo "elem-fail:${ip}" >> "$PRIO_STATE/err"
+	fi
+}
+
+# Fill the per-band address sets from the kernel neighbour tables.
+#
+# This is the whole IPv6 story: the router cannot predict which temporary
+# address a client will use, but while that client is downloading, its address
+# *is* in the neighbour table together with its MAC. Matching on the MAC gives
+# IPv4 and IPv6 -- including privacy addresses -- with one mechanism, and the
+# periodic re-run picks up a rotated address within a few seconds.
+refresh_addrs() {
+	local lan="$1"
+	refresh_family "$lan" 4
+	refresh_family "$lan" 6
+}
+
+refresh_family() {
+	local lan="$1" fam="$2" addr rest mac band set
+	local list="$PRIO_STATE/.neigh.$$"
+	if [ "$fam" = 6 ]; then
+		ip -6 neigh show dev "$lan" 2>/dev/null > "$list"
+	else
+		ip neigh show dev "$lan" 2>/dev/null > "$list"
+	fi
+	[ -s "$list" ] || { : > "$list"; return 0; }
+	while read -r addr rest; do
+		case "$addr" in
+			''|*[!0-9a-fA-F:.]*) continue ;;
+		esac
+		mac="$(printf '%s\n' "$rest" | grep -o 'lladdr [0-9a-f:]*' | cut -d' ' -f2)"
+		[ -n "$mac" ] || continue
+		band="$(band_for_mac "$mac")"
+		[ -n "$band" ] || continue
+		if [ "$fam" = 6 ]; then
+			set="s6_${band}"
+		else
+			set="s${band}"
+		fi
+		addr_known "$set" "$addr" && continue
+		if nft add element "$NFT_TABLE" "$set" "{ $addr }" 2>/dev/null; then
+			addr_remember "$set" "$addr"
+		fi
+	done < "$list"
+	: > "$list"
+}
+
+setup_nft() {
+	local bands="$1"
+	local wan="$2"
+	local lan="$3"
+	PRIO_BANDS_MAX=$((bands - 1))
+
+	nft delete table $NFT_TABLE 2>/dev/null
+	# One-time migration: v5 and earlier used a table literally named "prio".
+	# Leaving it behind would double-mark packets from stale sets.
+	nft delete table inet prio 2>/dev/null
+	nft add table $NFT_TABLE 2>>"$PRIO_STATE/err" || { echo "nft:fail" >> "$PRIO_STATE/status"; return 1; }
+
+	local b
+	for b in 0 1 2 3 4 5 6 7; do
+		nft add set $NFT_TABLE "s${b}" '{ type ipv4_addr; flags interval; }' 2>>"$PRIO_STATE/err"
+		# IPv6 mirrors of the same bands. Kept separate because a set has one
+		# address family; the band number and mark are shared.
+		nft add set $NFT_TABLE "s6_${b}" '{ type ipv6_addr; flags interval; }' 2>>"$PRIO_STATE/err"
+	done
+
+	config_foreach prio_nft_device device
+
+	# Upload: mark in the FORWARD hook with oifname = WAN. Forward runs after
+	# routing but before SNAT, so saddr is still the client's address, while
+	# oifname keeps LAN-to-LAN frames (which never leave via the WAN) unmarked.
+	# NOTE: the chain cannot be called "fwd" -- that is an nftables keyword.
+	nft add chain $NFT_TABLE upmark \
+		'{ type filter hook forward priority mangle; policy accept; }' 2>>"$PRIO_STATE/err"
+
+	# Download: ONE chain holds both the default band and the per-device
+	# overrides. Two chains at different priorities looked correct on paper
+	# (dstnat before dstnat+10) but in practice the default rule overwrote the
+	# per-device mark, so everything landed in the lowest band. Inside a single
+	# chain the evaluation order is guaranteed: rule 1 stamps the default band,
+	# the rules after it overwrite it for registered devices.
+	nft add chain $NFT_TABLE post \
+		'{ type filter hook prerouting priority dstnat + 10; policy accept; }' 2>>"$PRIO_STATE/err"
+
+	local rules=0
+	if nft add rule $NFT_TABLE post iifname "$wan" \
+		meta mark set meta mark and "$UNMARK_MASK" or "$(band_mark "$PRIO_BANDS_MAX")" \
+		2>>"$PRIO_STATE/err"; then
+		rules=$((rules + 1))
+	fi
+
+	for b in 0 1 2 3 4 5 6 7; do
+		local mark
+		mark="$(band_mark "$b")"
+		if nft add rule $NFT_TABLE upmark oifname "$wan" ip saddr "@s${b}" \
+			meta mark set meta mark and "$UNMARK_MASK" or "$mark" 2>>"$PRIO_STATE/err"; then
+			rules=$((rules + 1))
+		fi
+		if nft add rule $NFT_TABLE upmark oifname "$wan" ip6 saddr "@s6_${b}" \
+			meta mark set meta mark and "$UNMARK_MASK" or "$mark" 2>>"$PRIO_STATE/err"; then
+			rules=$((rules + 1))
+		fi
+		if nft add rule $NFT_TABLE post iifname "$wan" ip daddr "@s${b}" \
+			meta mark set meta mark and "$UNMARK_MASK" or "$mark" 2>>"$PRIO_STATE/err"; then
+			rules=$((rules + 1))
+		fi
+		if nft add rule $NFT_TABLE post iifname "$wan" ip6 daddr "@s6_${b}" \
+			meta mark set meta mark and "$UNMARK_MASK" or "$mark" 2>>"$PRIO_STATE/err"; then
+			rules=$((rules + 1))
+		fi
+	done
+
+	# Resolve every registered device's current addresses now, then keep them
+	# fresh (see start_refresh) so a rotated IPv6 address is picked up too.
+	[ -n "$lan" ] && refresh_addrs "$lan"
+
+	if [ "$rules" -gt 0 ]; then
+		echo "nft:ok($rules)" >> "$PRIO_STATE/status"
+	else
+		echo "nft:fail" >> "$PRIO_STATE/status"
+		return 1
+	fi
+	return 0
+}
+
+# ---------------- helpers ----------------
+band_leaves() {
+	local dev="$1" bands="$2" handle="${3:-1}"
+	local fq
+	fq="$(state_get fq_codel)"
+	[ -n "$fq" ] || fq=1
+	[ "$fq" = "1" ] || return 0
+	local i=1
+	while [ "$i" -le "$bands" ]; do
+		tc qdisc add dev "$dev" parent "${handle}:$i" fq_codel 2>>"$PRIO_STATE/err"
+		i=$((i + 1))
+	done
+}
+
+setup_filters() {
+	local dev="$1" bands="$2" handle="${3:-1}"
+	local b
+	for b in 0 1 2 3 4 5 6 7; do
+		[ "$b" -lt "$bands" ] || break
+		tc filter add dev "$dev" parent "${handle}:" protocol all prio 1 \
+			handle "$(band_mark "$b")/$MARK_MASK" fw flowid "${handle}:$((b + 1))" 2>>"$PRIO_STATE/err"
+	done
+}
+
+# ---------------- uplink: ETS at eth2 root ----------------
+# Rate for the shaped uplink class. The detector keeps its live value in
+# tmpfs; the config value only seeds it. 0 = do not shape the uplink at all.
+up_rate_kbit() {
+	local r
+	r="$(cat "$PRIO_STATE/up_rate" 2>/dev/null)"
+	case "$r" in ''|*[!0-9]*) r="" ;; esac
+	if [ -z "$r" ]; then
+		r="$(state_get uplink_kbit)"
+		case "$r" in ''|*[!0-9]*) r=0 ;; esac
+	fi
+	[ "$r" -lt 1000 ] 2>/dev/null && r=0
+	echo "$r"
+}
+
+apply_uplink_rate() {
+	local dev="$1" rate="$2"
+	local burst=$((rate / 8 * 20))
+	[ "$burst" -lt 8192 ] && burst=8192
+	[ "$burst" -gt 128000 ] && burst=128000
+	tc class change dev "$dev" parent 1: classid 1:100 \
+		htb rate "${rate}kbit" ceil "${rate}kbit" \
+		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"
+}
+
+# ---------------- uplink: optional HTB + ETS at eth2 root ----------------
+# Without a rate the uplink is only a scheduler, which is useless the moment
+# someone uploads: the 4G modem buffers a couple of seconds of packets and the
+# router never sees them. With a rate the queue is ours and the bands matter.
+setup_uplink() {
+	local dev="$1" bands="$2"
+	local rate applied
+
+	rate="$(up_rate_kbit)"
+	applied=$rate
+
+	qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
+
+	if [ "$applied" -lt 1000 ]; then
+		if ! tc qdisc add dev "$dev" root handle 1: ets bands "$bands" strict "$(strict_count "$bands")" 2>>"$PRIO_STATE/err"; then
+			echo "uplink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
+		band_leaves "$dev" "$bands" 1
+		setup_filters "$dev" "$bands" 1
+		echo "uplink:ok" >> "$PRIO_STATE/status"
+		echo "upshaper:off" >> "$PRIO_STATE/status"
+		return 0
+	fi
+
+	local burst=$((applied / 8 * 20))
+	[ "$burst" -lt 8192 ] && burst=8192
+	[ "$burst" -gt 128000 ] && burst=128000
+
+	if ! tc qdisc add dev "$dev" root handle 1: htb default 1 2>>"$PRIO_STATE/err"; then
+		echo "uplink:fail" >> "$PRIO_STATE/status"
+		return 1
+	fi
+	# 1:1 is everything that carries no band mark; 1:100 is internet traffic.
+	tc class add dev "$dev" parent 1: classid 1:1 htb rate 10Gbit ceil 10Gbit 2>>"$PRIO_STATE/err"
+	if ! tc class add dev "$dev" parent 1: classid 1:100 htb rate "${applied}kbit" ceil "${applied}kbit" burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"; then
+		tc qdisc del dev "$dev" root 2>/dev/null
+		echo "uplink:fail" >> "$PRIO_STATE/status"
+		return 1
+	fi
+	local b
+	for b in 0 1 2 3 4 5 6 7; do
+		[ "$b" -lt "$bands" ] || break
+		tc filter add dev "$dev" parent 1: protocol all prio 1 \
+			handle "$(band_mark "$b")/$MARK_MASK" fw flowid 1:100 2>>"$PRIO_STATE/err"
+	done
+	if ! tc qdisc add dev "$dev" parent 1:100 handle 2: ets bands "$bands" strict "$(strict_count "$bands")" 2>>"$PRIO_STATE/err"; then
+		tc qdisc del dev "$dev" root 2>/dev/null
+		echo "uplink:fail" >> "$PRIO_STATE/status"
+		return 1
+	fi
+	band_leaves "$dev" "$bands" 2
+	setup_filters "$dev" "$bands" 2
+	echo "uplink:ok" >> "$PRIO_STATE/status"
+	echo "upshaper:${applied}kbit" >> "$PRIO_STATE/status"
+	return 0
+}
+
+# ---------------- downlink: htb, only the internet class is shaped ----------------
+# LAN-to-LAN traffic carries no band mark (the nft post chain only tags packets
+# arriving on the WAN), so it lands in the default class 1:1 which is set to a
+# rate far above the LAN link -- effectively unlimited. Only marked traffic
+# (i.e. internet downloads) enters 1:100, which is shaped to the learned WAN
+# rate so the ETS inside it has a real queue to reorder.
+setup_downlink() {
+	local dev="$1" bands="$2"
+	local rate applied
+	rate="$(shaper_kbit)"
+	applied="$(applied_kbit "$rate")"
+
+	# Strip our own lines before re-emitting them; the detector calls this
+	# repeatedly and must not accumulate duplicate status rows.
+	if [ -f "$PRIO_STATE/status" ]; then
+		grep -vE '^(shaper|downlink|lanq):' "$PRIO_STATE/status" > "$PRIO_STATE/status.tmp" 2>/dev/null
+		mv "$PRIO_STATE/status.tmp" "$PRIO_STATE/status" 2>/dev/null
+	fi
+
+	qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
+
+	if [ "$rate" -ge 1000 ]; then
+		# burst ~20ms of traffic, clamped to a sane window
+		local burst=$((applied / 8 * 20))
+		[ "$burst" -lt 8192 ] && burst=8192
+		[ "$burst" -gt 256000 ] && burst=256000
+		# Default: the LAN class is effectively unlimited (10 Gbit). With LAN
+		# queueing enabled it is shaped at the real link speed instead, which
+		# builds a queue without capping below what the wire can actually do.
+		local lanrate
+		if [ "$(state_get lan_shaping)" = "1" ]; then
+			lanrate="$(lan_rate_kbit "$dev")"
+			echo "lanq:${lanrate}kbit" >> "$PRIO_STATE/status"
+		else
+			lanrate=10000000
+			echo "lanq:off" >> "$PRIO_STATE/status"
+		fi
+
+		if ! tc qdisc add dev "$dev" root handle 1: htb default 1 2>>"$PRIO_STATE/err"; then
+			echo "downlink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
+		tc class add dev "$dev" parent 1: classid 1:1 htb rate "${lanrate}kbit" ceil "${lanrate}kbit" 2>>"$PRIO_STATE/err"
+		# HTB leaves default to a plain pfifo; give the LAN class the same
+		# per-flow fairness the band classes get, otherwise a single local flow
+		# can starve the rest of the bridge.
+		tc qdisc add dev "$dev" parent 1:1 fq_codel 2>>"$PRIO_STATE/err"
+		if ! tc class add dev "$dev" parent 1: classid 1:100 htb rate "${applied}kbit" ceil "${applied}kbit" burst "${burst}b" 2>>"$PRIO_STATE/err"; then
+			tc qdisc del dev "$dev" root 2>/dev/null
+			echo "downlink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
+
+		# Outer classifier: any packet carrying one of our band marks is internet
+		# traffic and must go through the shaped class.
+		local b
+		for b in 0 1 2 3 4 5 6 7; do
+			tc filter add dev "$dev" parent 1: protocol all prio 1 \
+				handle "$(band_mark "$b")/$MARK_MASK" fw flowid 1:100 2>>"$PRIO_STATE/err"
+		done
+
+		if ! tc qdisc add dev "$dev" parent 1:100 handle 2: ets bands "$bands" strict "$(strict_count "$bands")" 2>>"$PRIO_STATE/err"; then
+			tc qdisc del dev "$dev" root 2>/dev/null
+			echo "downlink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
+		echo "shaper:${applied}kbit" >> "$PRIO_STATE/status"
+	else
+		# No rate learned yet: classification only, no queue (priority is inert
+		# until the detector has seen enough traffic).
+		if ! tc qdisc add dev "$dev" root handle 2: ets bands "$bands" strict "$(strict_count "$bands")" 2>>"$PRIO_STATE/err"; then
+			echo "downlink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
+		echo "shaper:pending" >> "$PRIO_STATE/status"
+	fi
+
+	band_leaves "$dev" "$bands" 2
+	setup_filters "$dev" "$bands" 2
+	# "ok" used to be written even on the classification-only path, so the page
+	# claimed "downlink OK" while no queue existed and priority was inert.
+	if [ "$rate" -ge 1000 ]; then
+		echo "downlink:ok" >> "$PRIO_STATE/status"
+	else
+		echo "downlink:inert" >> "$PRIO_STATE/status"
+	fi
+	return 0
+}
+
+# ---------------- IPv6 address refresh ----------------
+# A client that starts a new connection picks a new RFC 4941 temporary address.
+# The nft sets therefore cannot be filled once at start; they are topped up from
+# the neighbour table a few times a minute. Nothing is ever removed: a stale
+# entry costs one set slot, while dropping a live one would silently return that
+# device to the default band mid-download.
+stop_refresh() {
+	local pid
+	pid="$(cat "$PRIO_STATE/refresh.pid" 2>/dev/null)"
+	if [ -n "$pid" ]; then
+		kill "$pid" 2>/dev/null
+	fi
+	printf 'stopped.%s\n' "$$" > "$PRIO_STATE/refresh_gen" 2>/dev/null
+	: > "$PRIO_STATE/refresh.pid" 2>/dev/null
+}
+
+start_refresh() {
+	local lan="$1"
+	stop_refresh
+	[ -e "/sys/class/net/$lan" ] || { echo "refresh:no-iface" >> "$PRIO_STATE/err"; return 0; }
+	local gen
+	gen="$$"
+	if ! printf '%s\n' "$gen" > "$PRIO_STATE/refresh_gen" 2>/dev/null; then
+		return 0
+	fi
+	(
+		mygen="$gen"
+		tick=0
+		while [ "$(cat "$PRIO_STATE/refresh_gen" 2>/dev/null)" = "$mygen" ]; do
+			sleep 5
+			refresh_addrs "$lan"
+			tick=$((tick + 1))
+			# Self-heal, every 30s. A start can be lost to a racing save, a
+			# reboot that ran before netifd finished, or a qdisc flushed by
+			# another package. Without this the engine stays down while the
+			# LuCI switch still says "enabled", which looks like the setting
+			# being ignored. Reload runs detached so it can replace this loop.
+			[ $((tick % 6)) -eq 0 ] || continue
+			[ "$(state_get enabled)" = "1" ] || continue
+			qdisc_is_ours "$lan" && continue
+			now="$(date +%s 2>/dev/null)"; now="${now:-0}"
+			last="$(cat "$PRIO_STATE/heal.stamp" 2>/dev/null)"; last="${last:-0}"
+			case "$last" in ''|*[!0-9]*) last=0 ;; esac
+			[ $((now - last)) -ge 120 ] || continue
+			printf '%s\n' "$now" > "$PRIO_STATE/heal.stamp"
+			logger -t luci-app-prio "watchdog: engine enabled but qdisc missing, reloading"
+			( sleep 2; /etc/init.d/prio reload >/dev/null 2>&1 ) &
+		done
+	) </dev/null >/dev/null 2>&1 &
+	echo $! > "$PRIO_STATE/refresh.pid"
+	logger -t luci-app-prio "address refresh started on $lan"
+}
+
+# ---------------- bandwidth auto-detect ----------------
+stop_detect() {
+	local pid
+	pid="$(cat "$DETECT_PID" 2>/dev/null)"
+	if [ -n "$pid" ]; then
+		kill "$pid" 2>/dev/null
+		sleep 1
+		kill -9 "$pid" 2>/dev/null
+	fi
+	# Park a sentinel that no live loop can match. Truncating instead would let
+	# an orphaned loop (pidfile lost) keep matching an empty value and keep
+	# rebuilding the qdisc after the user turned the service off.
+	printf 'stopped.%s\n' "$$" > "$PRIO_STATE/detect_gen" 2>/dev/null
+	: > "$DETECT_PID" 2>/dev/null
+}
+
+# ---------------- rate application ----------------
+# Change only the HTB rate when the tree already exists. A full setup_downlink
+# deletes the root qdisc, which drops the whole queue and stutters every TCP
+# flow; rate changes are frequent, structural changes are not.
+apply_rate() {
+	local dev="$1" rate
+	rate="$(applied_kbit "$2")"
+	local burst=$((rate / 8 * 20))
+	[ "$burst" -lt 8192 ] && burst=8192
+	[ "$burst" -gt 256000 ] && burst=256000
+	tc class change dev "$dev" parent 1: classid 1:100 \
+		htb rate "${rate}kbit" ceil "${rate}kbit" \
+		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"
+}
+
+# Either change the rate in place or, when the tree is still the
+# classification-only one (no HTB root), build it properly.
+apply_downlink_rate() {
+	local lan="$1" bands="$2" rate="$3"
+	if tc qdisc show dev "$lan" 2>/dev/null | grep -q 'qdisc htb 1: root'; then
+		apply_rate "$lan" "$rate"
+	else
+		# setup_downlink() reads the rate through shaper_kbit(), so publish it
+		# first. Without this the very first seed rebuilt a classification-only
+		# tree (rate still 0), the learned value was stored but never applied,
+		# and the page showed a rate while the kernel had no shaping at all.
+		printf '%s\n' "$rate" > "$PRIO_STATE/shaper"
+		setup_downlink "$lan" "$bands"
+	fi
+}
+
+# Cumulative HTB overlimit counter for the shaped class. This is the only
+# signal that says "the shaper is what is holding the link back"; throughput
+# alone cannot say it, because the shaper is exactly what limits throughput.
+htb_overlimits() {
+	tc -s class show dev "$1" classid 1:100 2>/dev/null | \
+		sed -n 's/.*overlimits \([0-9][0-9]*\).*/\1/p' | head -n1
+}
+
+# centiseconds since boot; used to normalise every sample. Without this the
+# loop assumes each tick is exactly 1.000 s, but two forks plus a sleep make it
+# longer, which biases every rate estimate upward.
+now_cs() {
+	# cut+tr: integer centiseconds, no float, no octal trap. /proc/uptime is
+	# "12345.67 89.01"; stripping the dot yields centiseconds directly.
+	cut -d' ' -f1 /proc/uptime 2>/dev/null | tr -d '.' || echo 0
+}
+
+# One RTT sample, in whole milliseconds. busybox ping prints a summary line
+# "round-trip min/avg/max = 61.2/70.5/87.4 ms"; the MIN is what matters here:
+# the average is polluted by whatever queue we are about to react to.
+# Average RTT. The controller must react to a queue building up, and the
+# MINIMUM hides exactly that: with an upload saturating the modem the min can
+# stay at 18 ms while half the probes come back at 300 ms. The minimum is only
+# used to learn the baseline.
+rtt_avg_ms() {
+	local target out
+	target="$(state_get rtt_target)"
+	[ -n "$target" ] || target=223.5.5.5
+	out="$(ping -c 4 -W 1 "$target" 2>/dev/null | \
+		awk -F'= ' '/round-trip/{split($2,a,"/"); print int(a[2]+0); exit}')"
+	case "$out" in ''|*[!0-9]*) echo 0 ;; *) echo "$out" ;; esac
+}
+
+rtt_min_ms() {
+	local target out
+	target="$(state_get rtt_target)"
+	[ -n "$target" ] || target=223.5.5.5
+	out="$(ping -c 3 -W 1 "$target" 2>/dev/null | \
+		awk -F'= ' '/round-trip/{split($2,a,"/"); print int(a[1]+0); exit}')"
+	case "$out" in ''|*[!0-9]*) echo 0 ;; *) echo "$out" ;; esac
+}
+
+# Peak-based learning: the highest throughput the line was seen to deliver
+# while the shaper was NOT the bottleneck. That is a direct measurement of
+# capacity, and the safety margin decides how far below it we run. A closed
+# loop that hunts for the capacity edge was tried and rejected: it either
+# settled above the line (no local queue, priority dead) or collapsed to the
+# floor when the path latency changed. This one only ever records what the
+# line actually did.
+start_detect() {
+	local dev="$1" lan="$2" bands="$3"
+	stop_detect
+	[ "$(state_get auto_bandwidth)" = "1" ] || return 0
+	[ -e "/sys/class/net/$dev" ] || { echo "detect:no-iface" >> "$PRIO_STATE/err"; return 0; }
+
+	mkdir -p "$PRIO_STATE" 2>/dev/null
+	local gen
+	gen="$$"
+	if ! printf '%s\n' "$gen" > "$PRIO_STATE/detect_gen" 2>/dev/null; then
+		echo "detect:marker-fail" >> "$PRIO_STATE/err"
+		return 0
+	fi
+
+	(
+		mygen="$gen"
+		busy_floor=2000
+		# Everything between probes is open loop. Every probe_gap seconds the
+		# shaper opens itself for about 18 seconds: that measurement is the
+		# only thing that ever raises the estimate, and it is a real one -- the
+		# line is free to deliver everything it can.
+		#
+		# Nothing ever lowers it automatically. A download from a slow server
+		# is indistinguishable from a slow line from here, so an automatic
+		# downward move would let any limping CDN throttle the whole
+		# connection. "Re-learn" and the calibration are the way down.
+		# NOTE: these are seconds, and now_cs() counts centiseconds, so every
+		# use below multiplies by 100. Getting this wrong made the shaper open
+		# itself every 6 seconds, which is indistinguishable from no shaping.
+		probe_gap=300
+		next_probe=0
+		downmiss=0
+		link_max=0
+		spd="$(cat "/sys/class/net/$dev/speed" 2>/dev/null)"
+		case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
+		[ "$spd" -gt 0 ] && link_max=$((spd * 1000))
+		[ "$link_max" -gt 0 ] || link_max=1000000
+		ceiling=$((link_max * 95 / 100))
+
+		peak=$(state_get shaper_peak)
+		case "$peak" in ''|*[!0-9]*) peak=0 ;; esac
+		# Older builds stored the estimate in shaper_learned, which nothing
+		# writes any more. Take whichever survives so an upgrade does not
+		# restart the learner from zero and throttle a healthy line.
+		learned=$(state_get shaper_learned)
+		case "$learned" in ''|*[!0-9]*) learned=0 ;; esac
+		[ "$learned" -gt "$peak" ] && peak=$learned
+		# Values measured since the last reload live in tmpfs; start() only
+		# folds them into the config, this loop just keeps the best one.
+		pf=$(cat "$PRIO_STATE/peak" 2>/dev/null)
+		case "$pf" in ''|*[!0-9]*) pf=0 ;; esac
+		# The tmpfs value is the live estimate and may be LOWER than the config
+		# copy (the estimate follows the dips). Only the config copy seeds a
+		# fresh boot.
+		[ "$pf" -gt 0 ] && peak=$pf
+
+		last=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null) || {
+			echo "detect:no-rxbytes" >> "$PRIO_STATE/err"; exit 0; }
+		last_tx=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+		case "$last_tx" in ''|*[!0-9]*) last_tx=0 ;; esac
+		win_txb=0
+		last_t=$(now_cs)
+		case "$last_t" in ''|*[!0-9]*) last_t=0 ;; esac
+		win_bytes=0; win_cs=0
+		tick=0
+		last_over=$(htb_overlimits "$lan")
+		case "$last_over" in ''|*[!0-9]*) last_over=0 ;; esac
+
+		while [ "$(cat "$PRIO_STATE/detect_gen" 2>/dev/null)" = "$mygen" ]; do
+			sleep 1
+			cur=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+			cur_tx=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+			case "$cur_tx" in ''|*[!0-9]*) cur_tx=0 ;; esac
+			if [ "$cur_tx" -ge "$last_tx" ] && [ "$last_tx" -gt 0 ]; then
+				win_txb=$(( win_txb + cur_tx - last_tx ))
+			fi
+			[ "$cur_tx" -gt 0 ] && last_tx=$cur_tx
+			if [ -z "$cur" ]; then
+				echo "detect:gone" >> "$PRIO_STATE/err"
+				sleep 5
+				continue
+			fi
+			tnow=$(now_cs)
+			case "$tnow" in ''|*[!0-9]*) tnow=$last_t ;; esac
+			dt=$((tnow - last_t))
+			if [ "$dt" -lt 50 ]; then
+				last_t=$tnow
+				last=$cur
+				win_txb=0
+				continue
+			fi
+			if [ "$dt" -gt 500 ]; then
+				# A stall (a slow tc call, the scheduler) must not be charged
+				# to this window: drop what was accumulated instead of turning
+				# the gap into a throughput figure.
+				last_t=$tnow
+				last=$cur
+				win_bytes=0
+				win_txb=0
+				win_cs=0
+				continue
+			fi
+			last_t=$tnow
+			if [ "$cur" -lt "$last" ]; then
+				last=$cur
+				win_cs=$(( win_cs + dt ))
+				continue
+			fi
+			win_bytes=$(( win_bytes + cur - last ))
+			win_cs=$(( win_cs + dt ))
+			last=$cur
+			# Boundary on real elapsed time, not on a tick count: a slow tick
+			# used to stretch a "20 second" window to a minute, and a probe
+			# window is the shape of the whole design.
+			[ "$win_cs" -ge 2000 ] || continue
+
+			[ "$(cat "$PRIO_STATE/detect_gen" 2>/dev/null)" = "$mygen" ] || exit 0
+			# real elapsed time, not the nominal 20s: ping/other work stretches
+			# the window and a fixed divisor inflates the number by ~10-16%.
+			if [ "$win_cs" -lt 1 ]; then
+				win_bytes=0
+				continue
+			fi
+			thr=$(( win_bytes * 8 * 100 / win_cs / 1000 ))
+			thr_up=$(( win_txb * 8 * 100 / win_cs / 1000 ))
+			win_bytes=0; win_txb=0; win_cs=0
+			now=$(now_cs)
+
+			over=$(htb_overlimits "$lan")
+			case "$over" in ''|*[!0-9]*) over=0 ;; esac
+			queued=0
+			[ "$over" -gt "$last_over" ] && queued=1
+			last_over=$over
+			qtxt=none
+			[ "$queued" = 1 ] && qtxt=ok
+			[ "$thr" -lt "$busy_floor" ] && qtxt=idle
+			printf '%s\n' "$qtxt" > "$PRIO_STATE/queue.tmp" &&
+				mv "$PRIO_STATE/queue.tmp" "$PRIO_STATE/queue" 2>/dev/null
+
+			rate=$(shaper_kbit)
+			applied=$(applied_kbit "$rate")
+			# A fresh install (or right after "re-learn") has no rate: 0 flows
+			# through every branch and the floor turns it into 1.8 Mbit, which
+			# then needs ~50 minutes of +3% to climb back. Seed it from the
+			# traffic that is flowing right now instead.
+			if [ "$rate" -lt 2000 ] && [ "$thr" -gt "$busy_floor" ]; then
+				mseed=$(margin_pct)
+				rate=$(( thr * 100 / (100 - mseed) ))
+				[ "$rate" -gt "$ceiling" ] && rate=$ceiling
+				if apply_downlink_rate "$lan" "$bands" "$rate"; then
+					printf '%s\n' "$rate" > "$PRIO_STATE/shaper"
+					logger -t luci-app-prio "rate seeded from traffic: ${rate}kbit"
+				fi
+			fi
+
+			# Both directions idle: the only honest place to learn the baseline.
+			# The MIN is used here (a jittery sample would inflate the floor and
+			# push the controller above the real capacity), and the upload control
+			# below still runs so that an upload with no download is governed.
+			if [ "$thr" -lt "$busy_floor" ] && [ "$thr_up" -le 1500 ]; then
+				rtt=$(rtt_min_ms)
+				case "$rtt" in ''|*[!0-9]*) rtt=0 ;; esac
+				if [ "$rtt" -gt 0 ]; then
+					base=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
+					case "$base" in ''|*[!0-9]*) base=0 ;; esac
+					bad=$(cat "$PRIO_STATE/rtt_bad" 2>/dev/null)
+					case "$bad" in ''|*[!0-9]*) bad=0 ;; esac
+					if [ "$base" -eq 0 ] || [ "$rtt" -lt "$base" ]; then
+						printf '%s\n' "$rtt" > "$PRIO_STATE/rtt_base"
+						bad=0
+					elif [ "$rtt" -gt $(( base * 3 / 2 )) ]; then
+						# The path got slower (new cell, new route). A baseline that
+						# can only go down would then judge every window as
+						# congestion and cut the rate forever.
+						bad=$(( bad + 1 ))
+						if [ "$bad" -ge 3 ]; then
+							printf '%s\n' "$rtt" > "$PRIO_STATE/rtt_base"
+							bad=0
+							logger -t luci-app-prio "latency baseline reset to ${rtt}ms"
+						fi
+					else
+						bad=0
+					fi
+					printf '%s\n' "$bad" > "$PRIO_STATE/rtt_bad"
+				fi
+			fi
+
+			# ---- uplink control, on its own gate ----
+			# It used to sit inside the download branch, so a pure upload (no
+			# download) never reached it: the controller that exists to stop an
+			# upload from wrecking the latency was the one thing not running.
+			up=$(up_rate_kbit)
+			if [ "$up" -ge 1000 ] && [ "$thr_up" -gt 1500 ]; then
+				urtt=$(rtt_avg_ms)
+				case "$urtt" in ''|*[!0-9]*) urtt=0 ;; esac
+				ubase=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
+				case "$ubase" in ''|*[!0-9]*) ubase=0 ;; esac
+				uthr=$(( ubase * 4 / 10 ))
+				[ "$uthr" -lt 20 ] && uthr=20
+				newup=$up
+				if [ "$urtt" -eq 0 ]; then
+					newup=$(( up * 85 / 100 ))
+				elif [ "$ubase" -gt 0 ] && [ "$urtt" -gt $(( ubase + 80 )) ]; then
+					# proportional, at most -12% per window
+					newup=$(( up * (ubase + 40) / urtt ))
+					[ "$newup" -gt $(( up * 88 / 100 )) ] && newup=$(( up * 88 / 100 ))
+				elif [ "$ubase" -gt 0 ] && [ "$urtt" -le $(( ubase + uthr )) ]; then
+					newup=$(( up * 103 / 100 ))
+					[ "$newup" -gt 200000 ] && newup=200000
+				fi
+				[ "$newup" -lt 2000 ] && newup=2000
+				if [ "$newup" -ne "$up" ]; then
+					if apply_uplink_rate "$dev" "$newup"; then
+						printf '%s\n' "$newup" > "$PRIO_STATE/up_rate"
+						logger -t luci-app-prio "uplink ${up} -> ${newup}kbit (rtt ${urtt}ms, idle ${ubase}ms)"
+					fi
+				fi
+			fi
+
+			if [ "$thr" -lt "$busy_floor" ]; then
+				continue
+			fi
+
+			# ---- rate control on measured latency ----
+			# Throughput is useless as a control signal here: this 4G cell moved
+			# from 160 to 8 Mbit/s inside an hour, and a download from a slow
+			# server looks exactly like a slow line. Latency does not have that
+			# problem. Measured on the router itself, same traffic:
+			#     cap 20000 -> 1068 ms average
+			#     cap  8000 ->   32 ms average
+			# So with traffic flowing: round trip near the idle baseline means the
+			# shaper sits below the real capacity and can be raised a little;
+			# a blown-up round trip means the queue is inside the modem and the
+			# cap has to come down.
+			rtt=$(rtt_avg_ms)
+			case "$rtt" in ''|*[!0-9]*) rtt=0 ;; esac
+			base=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
+			case "$base" in ''|*[!0-9]*) base=0 ;; esac
+			# how far above the idle baseline still counts as "queue on us"
+			up_thr_hi=$(( base * 4 / 10 ))
+			[ "$up_thr_hi" -lt 20 ] && up_thr_hi=20
+			# base+15 was a dead zone 45 ms wide: with a jittery 4G line the
+			# round trip usually landed inside it and the controller did nothing
+			# at all, which is neither "below capacity" nor "over it". The raise
+			# window now scales with the baseline, and the cut is proportional.
+			# Three windows in a row with no answer at all means the probe target
+			# is unusable (wrong address, ICMP filtered), not that the line is
+			# slow. Hold the rate instead of walking it to the floor and
+			# persisting that across reboots.
+			if [ "$rtt" -eq 0 ]; then
+				downmiss=$(( downmiss + 1 ))
+			else
+				downmiss=0
+			fi
+			if [ "$downmiss" -ge 3 ]; then
+				grep -q 'probe:down' "$PRIO_STATE/status" 2>/dev/null ||
+					echo "probe:down" >> "$PRIO_STATE/status"
+				continue
+			fi
+			newrate=$rate
+			if [ "$rtt" -eq 0 ]; then
+				newrate=$(( rate * 80 / 100 ))
+			elif [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 80 )) ]; then
+				newrate=$(( rate * (base + 40) / rtt ))
+				[ "$newrate" -gt $(( rate * 88 / 100 )) ] && newrate=$(( rate * 88 / 100 ))
+			elif [ "$base" -gt 0 ] && [ "$rtt" -le $(( base + up_thr_hi )) ]; then
+				newrate=$(( rate * 103 / 100 ))
+				[ "$newrate" -gt "$ceiling" ] && newrate=$ceiling
+			fi
+			[ "$newrate" -lt 2000 ] && newrate=2000
+			if [ "$newrate" -ne "$rate" ]; then
+				if apply_downlink_rate "$lan" "$bands" "$newrate"; then
+					printf '%s\n' "$newrate" > "$PRIO_STATE/shaper"
+					printf '%s\n' "$newrate" > "$PRIO_STATE/peak"
+					peak=$newrate
+					logger -t luci-app-prio "rate ${rate} -> ${newrate}kbit (rtt ${rtt}ms, idle ${base}ms)"
+				fi
+			fi
+
+			continue
+
+		done
+	) </dev/null >/dev/null 2>&1 &
+	echo $! > "$DETECT_PID"
+	logger -t luci-app-prio "bandwidth auto-detect started on $dev (capacity peak, pid $(cat "$DETECT_PID"))"
+}
+
+# ---------------------------------------------------------------------------
+# Calibration: sweep the rate while a real download runs and print what the
+# line actually delivers and how much latency it costs at each step. Open loop
+# on purpose -- no feedback, no oscillation, just measurements you can pick a
+# working point from.
+# ---------------------------------------------------------------------------
+ifrate() {
+	local dev="$1" secs="${2:-4}" a b
+	a=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+	sleep "$secs"
+	b=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+	case "$a$b" in ''|*[!0-9]*) echo 0 ;; *) echo $(( (b - a) * 8 / 1000 / secs )) ;; esac
+}
+
+# Throughput that actually crossed the shaped class, in kbit/s. ifrate() above
+# counts bytes arriving on WAN, which is the *offer*: packets the shaper will
+# drop, retransmissions and other clients are all in it, so it can never prove
+# that a given rate was the bottleneck. This one is read after the queue.
+shaped_kbit() {
+	local lan="$1" secs="${2:-6}" a b
+	a=$(tc -s class show dev "$lan" classid 1:100 2>/dev/null | \
+		sed -n 's/.*Sent \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)
+	case "$a" in ''|*[!0-9]*) echo 0; return 1 ;; esac
+	sleep "$secs"
+	b=$(tc -s class show dev "$lan" classid 1:100 2>/dev/null | \
+		sed -n 's/.*Sent \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)
+	case "$b" in ''|*[!0-9]*) echo 0; return 1 ;; esac
+	[ "$b" -ge "$a" ] || { echo 0; return 1; }
+	# Not $(( (b-a) / 125 / secs )): the counter is cumulative for the life of
+	# the qdisc, so on a fast line it passes 2^31 within minutes and shell
+	# arithmetic would wrap. awk uses doubles and does not care.
+	awk -v a="$a" -v b="$b" -v s="$secs" \
+		'BEGIN { printf "%d\n", (b - a) / 125 / s }'
+}
+
+nudge_rate() {
+	local lan="$1" rate="$2"
+	local burst=$((rate / 8 * 20))
+	[ "$burst" -lt 8192 ] && burst=8192
+	[ "$burst" -gt 256000 ] && burst=256000
+	tc class change dev "$lan" parent 1: classid 1:100 \
+		htb rate "${rate}kbit" ceil "${rate}kbit" \
+		burst "${burst}b" cburst "${burst}b" 2>/dev/null
+}
+
+# The closer the probe target, the cleaner the signal: a hop inside the ISP's
+# own network shows the access link's queue immediately, while a far target
+# mixes in that server's path. Walk the route, skip the gateway, and take the
+# first few hops that answer, preferring the fastest one.
+pickprobe() {
+	local seed out cands best bestrtt ip r loss
+	seed="$(state_get probe_seed)"
+	[ -n "$seed" ] || seed=223.5.5.5
+	command -v traceroute >/dev/null 2>&1 || {
+		echo "no traceroute" > "$PRIO_STATE/probe.txt"
+		return 1
+	}
+	out="$(traceroute -n -w 1 -q 1 -m 8 "$seed" 2>/dev/null)"
+
+	# Collect the fastest few hops that answer the traceroute, then keep only
+	# the ones that also answer a plain ping. The first hop is the ISP's
+	# gateway and usually drops ICMP echo, which makes it useless as a probe.
+	cands="$(printf '%s\n' "$out" | awk '
+		BEGIN { best = 99999 }
+		$2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $4 == "ms" &&
+		$1 >= 3 && $1 <= 7 && $3 + 0 < 80 {
+			n++; ip[n] = $2; r[n] = $3 + 0
+		}
+		END {
+			for (i = 1; i <= n; i++)
+				for (j = i + 1; j <= n; j++)
+					if (r[j] < r[i]) {
+						t = r[i]; r[i] = r[j]; r[j] = t
+						tt = ip[i]; ip[i] = ip[j]; ip[j] = tt
+					}
+			for (i = 1; i <= n && i <= 4; i++) print ip[i], r[i]
+		}')"
+
+	best=""
+	while read -r ip r; do
+		[ -n "$ip" ] || continue
+		loss="$(ping -c 4 -W 1 "$ip" 2>/dev/null | \
+			sed -n 's/.*received, \([0-9][0-9]*\)% packet loss.*/\1/p')"
+		if [ "$loss" = "0" ]; then
+			best="$ip"; bestrtt="$r"
+			break
+		fi
+	done <<EOF
+$cands
+EOF
+
+	if [ -z "$best" ]; then
+		echo "附近没有既能追踪又能 ping 通的节点，保持原目标。" > "$PRIO_STATE/probe.txt"
+		return 1
+	fi
+	printf '探测目标已设为 %s（traceroute %s ms，ping 无丢包）\n' "$best" "$bestrtt" \
+		> "$PRIO_STATE/probe.txt"
+	state_set rtt_target "$best"
+	logger -t luci-app-prio "probe target -> $best (${bestrtt}ms)"
+	echo "$best"
+	return 0
+}
+
+calibrate() {
+	local dev lan out
+	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"; [ -n "$dev" ] || dev="$(state_get wan_iface)"
+	lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"; [ -n "$lan" ] || lan="$(state_get lan_iface)"
+	out="$PRIO_STATE/calib.txt"
+	# A probe has to be exclusive. The detector rewrites the same HTB class
+	# every 20 seconds, so without stopping it every sweep step was silently
+	# undone about as often as it was applied.
+	if ! acquire_lock; then
+		: > "$out"
+		printf '另一个设置动作正在运行，请过几秒再试。\n' > "$out"
+		return 1
+	fi
+	# Only now, while holding the lock: a second click racing this one must not
+	# wipe the previous table and suggestion before it discovers it has no lock.
+	rm -f "$PRIO_STATE/calib_suggest"
+	: > "$out"
+	stop_detect
+	local bands
+	bands="$(state_get bands)"
+	case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
+
+	local orig made=0 restore_done=0
+	orig=$(shaper_kbit)
+	# Getting killed halfway through a sweep used to leave the classifier at
+	# whatever step it died on, with the detector already stopped: the line
+	# stayed pinned to a random rate until the next reload.
+	restore_calib() {
+		[ "$restore_done" = 1 ] && return 0
+		restore_done=1
+		stop_detect
+		if [ "$orig" -ge 1000 ]; then
+			printf '%s\n' "$orig" > "$PRIO_STATE/shaper"
+			nudge_rate "$lan" "$(applied_kbit "$orig")"
+		elif [ "$made" = 1 ]; then
+			: > "$PRIO_STATE/shaper"
+			setup_downlink "$lan" "$bands"
+		fi
+		if [ "$(state_get auto_bandwidth)" = "1" ]; then
+			start_detect "$dev" "$lan" "$bands"
+		fi
+	}
+	trap 'restore_calib; release_lock; exit 1' INT TERM HUP
+
+	local i=0 k=0
+	# Ten seconds is enough to tell "no download" from "slow start"; the old
+	# two-minute wait looked like a hung page.
+	printf '正在检查下载流量（最多 10 秒）...\n' >> "$out"
+	while [ "$i" -lt 10 ]; do
+		k=$(ifrate "$dev" 1)
+		[ "$k" -gt 5000 ] && break
+		i=$((i + 1))
+	done
+	if [ "$k" -le 5000 ]; then
+		: > "$out"
+		printf '没检测到下载流量。请先开始一个大文件下载，再运行校准。\n' > "$out"
+		release_lock
+		if [ "$(state_get auto_bandwidth)" = "1" ]; then
+			start_detect "$dev" "$lan" "$bands"
+		fi
+		return 1
+	fi
+
+	# make sure the HTB tree exists at all
+	if ! tc qdisc show dev "$lan" 2>/dev/null | grep -q 'qdisc htb 1: root'; then
+		printf '%s\n' 120000 > "$PRIO_STATE/shaper"
+		setup_downlink "$lan" "$bands"
+		made=1
+	fi
+
+	: > "$out"
+	: > "$PRIO_STATE/calib.raw"
+	printf '校准时间: %s\n下载流量约 %s Mbps\n\n' "$(date)" "$((k / 1000))" >> "$out"
+
+	# Step 1: how much does the line actually deliver with the shaper out of
+	# the way? That number is the ceiling for every later step and the hard
+	# upper bound for the recommendation. The old code swept a fixed
+	# 60..300 Mbit/s list: on a 50 Mbit/s line not one step was limiting, so
+	# every step measured the ISP's buffer and the highest step looked best.
+	local wide; wide=$((k * 3))
+	[ "$wide" -lt 50000 ] && wide=50000
+	nudge_rate "$lan" "$wide"
+	sleep 10
+	local top; top=$(shaped_kbit "$lan" 6)
+	[ "$top" -ge 10000 ] || top=$k
+	# If even the wide-open step cannot deliver what the line was already
+	# doing, the download stopped: everything below would be measured against
+	# an idle link and the "recommendation" would be a throughput figure of
+	# 1 Mbit/s. Refuse to produce numbers at all.
+	if [ "$top" -lt $(( k / 2 )) ]; then
+		: > "$PRIO_STATE/calib.raw"
+		printf '限速放开后实测只有 %s Mbps，而校准时检测到 %s Mbps 的流量，说明下载中途停了。\n' \
+			"$((top / 1000))" "$((k / 1000))" >> "$out"
+		printf '这一轮不作数，请保持下载不中断再校准一次。\n' >> "$out"
+		restore_calib
+		release_lock
+		return 1
+	fi
+	printf '线路能跑: %s Mbps（限速放开时实测）\n\n' "$((top / 1000))" >> "$out"
+	printf '限速(Mbps)  实测(Mbps)  最小/平均/最大 RTT(ms)\n' >> "$out"
+	printf '----------------------------------------------\n' >> "$out"
+
+	# Step 2: walk DOWN from the measured capacity. Going down keeps TCP from
+	# stalling on a sudden drop (300 -> 40 Mbit/s costs a retransmit timeout);
+	# each step gets 10 s to settle and then a 6 s sample, so the number is the
+	# answer to the new rate rather than the tail of the previous one.
+	local p r rtt thr avg aborted=0
+	for p in 100 90 80 70 60; do
+		r=$(( top / 1000 * p / 100 * 1000 ))
+		[ "$r" -ge 1000 ] || continue
+		nudge_rate "$lan" "$r"
+		sleep 10
+		thr=$(shaped_kbit "$lan" 6)
+		rtt=$(ping -c 10 -W 1 "$(state_get rtt_target 2>/dev/null || echo 223.5.5.5)" 2>/dev/null | \
+			tail -1 | sed 's/.*= //')
+		[ -n "$rtt" ] || rtt="-"
+		avg=$(printf '%s' "$rtt" | awk -F'/' '{print int($2)}')
+		case "$avg" in ''|*[!0-9]*) avg=0 ;; esac
+		printf '%7s   %8s   %s\n' "$((r / 1000))" "$((thr / 1000))" "$rtt" >> "$out"
+		if [ "$thr" -le 0 ] || [ "$thr" -lt $(( k / 4 )) ]; then
+			printf '\n这一档只有 %s Mbps（校准时是 %s Mbps），下载已经停了，校准中止。\n' \
+				"$((thr / 1000))" "$((k / 1000))" >> "$out"
+			aborted=1
+			break
+		fi
+		[ "$avg" -gt 0 ] && printf '%s %s %s\n' "$r" "$thr" "$avg" >> "$PRIO_STATE/calib.raw"
+	done
+
+	local restore_done=0
+	# Getting killed halfway through a sweep used to leave the classifier at
+	# whatever step it died on, with the detector already stopped: the line
+	# stayed pinned to a random rate until the next reload.
+	restore_calib() {
+		[ "$restore_done" = 1 ] && return 0
+		restore_done=1
+		stop_detect
+		if [ "$orig" -ge 1000 ]; then
+			printf '%s\n' "$orig" > "$PRIO_STATE/shaper"
+			nudge_rate "$lan" "$(applied_kbit "$orig")"
+		elif [ "$made" = 1 ]; then
+			: > "$PRIO_STATE/shaper"
+			setup_downlink "$lan" "$bands"
+		fi
+		if [ "$(state_get auto_bandwidth)" = "1" ]; then
+			start_detect "$dev" "$lan" "$bands"
+		fi
+	}
+	trap 'restore_calib; release_lock; exit 1' INT TERM HUP
+
+	# Step 3: put the engine back exactly the way it was before we touched it.
+	restore_calib
+
+	if [ "$aborted" = 1 ]; then
+		release_lock
+		return 1
+	fi
+	# Pick the highest rate whose latency is still close to the best seen, and
+	# whose throughput is still near the best -- exactly the "52ms vs 60ms"
+	# judgement, done on the collected numbers. Two guards matter: a step only
+	# carries information when the shaper really was the bottleneck (otherwise
+	# it is the ISP that limited us and the step says nothing), and the answer
+	# can never exceed what the line delivered with the shaper out of the way.
+	awk -v top="$top" -v k="$k" -v out="$PRIO_STATE/calib_suggest" '
+		NF == 3 && $3 > 0 {
+			n++
+			rate[n] = $1; thr[n] = $2; avg[n] = $3
+			if (minavg == 0 || $3 < minavg) minavg = $3
+			if ($2 > bestthr) bestthr = $2
+		}
+		END {
+			if (n == 0 || minavg == 0) exit 1
+			for (i = 1; i <= n; i++) {
+				if (thr[i] < rate[i] * 0.80) continue
+				if (avg[i] > minavg + 10) continue
+				if (rate[i] > rec) { rec = rate[i]; recavg = avg[i] }
+			}
+			if (rec == 0) { rec = int(bestthr * 0.90 / 1000) * 1000; recavg = minavg }
+			cap = top * 0.95
+			if (rec > cap) { rec = int(cap / 1000) * 1000 }
+			# A round in which the download was not there cannot recommend
+			# anything. Without these two guards it happily offered 1 Mbit/s,
+			# and one click on that would have throttled the whole connection.
+			if (bestthr < k * 0.50) exit 1
+			if (rec < 5000) exit 1
+			printf "\n最低延迟 %d ms，最高实测吞吐 %d Mbps\n", minavg, int(bestthr / 1000)
+			printf "建议下行速率: %d kbit/s（该档平均延迟 %d ms）\n", rec, recavg
+			print rec > out
+		}' "$PRIO_STATE/calib.raw" >> "$out"
+
+	if [ ! -s "$PRIO_STATE/calib_suggest" ]; then
+		printf '\n这组数据没能给出建议值（可能每一档都被线路本身限制住了）。\n' >> "$out"
+		printf '换一个能跑满的下载再校准一次。\n' >> "$out"
+		release_lock
+		return 1
+	fi
+	printf '\n完成。上面每一行就是"这个限速下，实际能跑多少、延迟多大"。\n' >> "$out"
+	release_lock
+	return 0
+}
+
+# ---------------- main ----------------
+start() {
+	config_load prio
+	config_get_bool enabled main enabled 0
+	# Nothing has been touched yet, so returning is safe: reload() no longer
+	# tears anything down before calling start(). Calling stop() here would be
+	# worse -- a single stale read of the config would dismantle a healthy
+	# engine that the user never asked to turn off.
+	[ "$enabled" = 1 ] || return 0;
+
+	mkdir -p "$PRIO_STATE" 2>/dev/null
+	acquire_lock || return 1
+	: > "$PRIO_STATE/status"
+	: > "$PRIO_STATE/err"
+	: > "$PRIO_STATE/ipmap"
+	: > "$PRIO_STATE/macmap"
+	: > "$PRIO_STATE/addrseen"
+	[ -f "$PRIO_STATE/shaper" ] || : > "$PRIO_STATE/shaper"
+
+	local bands uplink downlink dev lan auto_fp auto_bw
+	config_get bands main bands 3
+	case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
+	config_get_bool uplink   main uplink 1
+	config_get_bool downlink main downlink 1
+	config_get dev main wan_iface eth2
+	config_get lan main lan_iface br-lan
+	config_get_bool auto_fp main auto_hnat_off 1
+	config_get_bool auto_bw main auto_bandwidth 1
+
+	# Fold the tmpfs estimate into the config, here and only here: this point
+	# holds the lock, while the background detector does not. Its uci commit
+	# used to rewrite the whole file and could resurrect the auto_bandwidth
+	# value from before a save (observed: auto flipped back to 1).
+	local pf lf
+	pf="$(cat "$PRIO_STATE/peak" 2>/dev/null)"
+	case "$pf" in ''|*[!0-9]*) pf=0 ;; esac
+	lf="$(state_get shaper_learned)"
+	case "$lf" in ''|*[!0-9]*) lf=0 ;; esac
+	# The uplink controller keeps its live value in tmpfs; turning the uplink
+	# shaping off (uplink_kbit=0) has to throw it away, otherwise the old value
+	# keeps shaping after a reload.
+	local upcfg
+	upcfg="$(state_get uplink_kbit)"
+	case "$upcfg" in ''|*[!0-9]*) upcfg=0 ;; esac
+	if [ "$upcfg" -lt 1000 ]; then
+		: > "$PRIO_STATE/up_rate"
+	fi
+
+	# "forget the learned rate" deletes both keys; anything left in tmpfs must
+	# not resurrect them on the next start, which is exactly what made that
+	# button look broken.
+	if [ -z "$(state_get shaper_learned)" ] && [ -z "$(state_get shaper_peak)" ]; then
+		: > "$PRIO_STATE/peak"
+		: > "$PRIO_STATE/probes"
+	elif [ "$pf" -ge 5000 ] && [ "$pf" -ne "$lf" ]; then
+		state_set shaper_learned "$pf"
+		state_set shaper_peak "$pf"
+	fi
+
+	# With auto-detection off the UCI value is authoritative. Also drop the
+	# learned rate when the WAN interface changed: a rate measured on the old
+	# uplink would be wrong on the new one and would never self-correct.
+	if [ "$auto_bw" != 1 ] || [ "$(cat "$PRIO_STATE/dev" 2>/dev/null)" != "$dev" ]; then
+		: > "$PRIO_STATE/shaper" 2>/dev/null
+	fi
+	# A rate learned on the previous uplink is meaningless on the new one, so
+	# drop the persisted copy too -- but only when the interface really changed.
+	if [ -n "$(cat "$PRIO_STATE/dev" 2>/dev/null)" ] &&
+	   [ "$(cat "$PRIO_STATE/dev" 2>/dev/null)" != "$dev" ]; then
+		state_set shaper_learned ""
+		# Both keys: the detector starts from whichever is larger, so leaving
+		# the peak behind would keep the old line's rate on the new interface.
+		state_set shaper_peak ""
+	fi
+
+	# The uplink and downlink hooks must be on different interfaces.
+	if [ "$dev" = "$lan" ]; then
+		echo "wan_iface == lan_iface, refusing" >> "$PRIO_STATE/err"
+		logger -t luci-app-prio "wan_iface and lan_iface are both $dev, refusing"
+		release_lock
+		return 1
+	fi
+
+	# 1. Acceleration: software flow offloading keeps packets on the qdisc path.
+	if [ "$auto_fp" = 1 ]; then
+		local cur saved
+		cur="$(uci -q get turboacc.config.fastpath)"
+		saved="$(state_get saved_fastpath)"
+		if [ -z "$cur" ]; then
+			# turboacc absent: nothing to switch, and never create its config
+			echo "hnat:no-turboacc" >> "$PRIO_STATE/status"
+		elif [ "$cur" != "flow_offloading" ] && [ "$cur" != "disabled" ]; then
+			state_set saved_fastpath "$cur"
+			uci -q set turboacc.config.fastpath='flow_offloading' && uci -q commit turboacc
+			/etc/init.d/c2000max-hnat reload >/dev/null 2>&1
+			wait_hnat_down || true
+			# The controller writes "unknown" while converging and only then
+			# the final state. It can bail out early (a reload_firewall race,
+			# a bind table that is not empty yet), leaving the marker behind --
+			# which is exactly what the page shows to the user. Retry once.
+			local eff
+			eff="$(cat "$EFFECTIVE_STATE" 2>/dev/null)"
+			if [ "$eff" != "flow_offloading" ]; then
+				logger -t luci-app-prio "accel state after switch: '${eff}', retrying"
+				sleep 2
+				/etc/init.d/c2000max-hnat reload >/dev/null 2>&1
+				wait_hnat_down || true
+				eff="$(cat "$EFFECTIVE_STATE" 2>/dev/null)"
+				logger -t luci-app-prio "accel state after retry: '${eff}'"
+			fi
+			logger -t luci-app-prio "fastpath $cur -> flow_offloading"
+		fi
+		# verify the hardware hook really went down
+		if [ -r "$HNAT_TOGGLE" ]; then
+			[ "$(cat "$HNAT_TOGGLE" 2>/dev/null)" = "disabled" ] &&
+				echo "hnat:off" >> "$PRIO_STATE/status" ||
+				echo "hnat:still-enabled" >> "$PRIO_STATE/status"
+		else
+			echo "hnat:unknown" >> "$PRIO_STATE/status"
+		fi
+	fi
+
+	# 2. netfilter marking
+	setup_nft "$bands" "$dev" "$lan"
+
+	# 3. uplink
+	if [ "$uplink" = 1 ]; then
+		setup_uplink "$dev" "$bands"
+	elif qdisc_is_ours "$dev"; then
+		tc qdisc del dev "$dev" root 2>/dev/null
+	fi
+
+	# 4. downlink
+	if [ "$downlink" = 1 ]; then
+		setup_downlink "$lan" "$bands"
+		[ "$auto_bw" = 1 ] && start_detect "$dev" "$lan" "$bands"
+		start_refresh "$lan"
+	elif qdisc_is_ours "$lan"; then
+		tc qdisc del dev "$lan" root 2>/dev/null
+	fi
+
+	printf '%s\n' "$dev" > "$PRIO_STATE/dev"
+	printf '%s\n' "$lan" > "$PRIO_STATE/lan"
+	echo "started" >> "$PRIO_STATE/status"
+	logger -t luci-app-prio "priority engine started (bands=$bands wan=$dev lan=$lan)"
+	release_lock
+}
+
+stop() {
+	config_load prio
+	local dev lan saved
+	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
+	lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"
+	[ -n "$dev" ] || config_get dev main wan_iface eth2
+	[ -n "$lan" ] || config_get lan main lan_iface br-lan
+
+	stop_detect
+	stop_refresh
+	nft delete table $NFT_TABLE 2>/dev/null
+	nft delete table inet prio 2>/dev/null
+
+	qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
+	qdisc_is_ours "$lan" && tc qdisc del dev "$lan" root 2>/dev/null
+
+	# Restore acceleration only if we changed it; clear the marker regardless.
+	saved="$(state_get saved_fastpath)"
+	if [ -n "$saved" ]; then
+		uci -q set turboacc.config.fastpath="$saved"
+		uci -q commit turboacc
+		/etc/init.d/c2000max-hnat reload >/dev/null 2>&1
+		logger -t luci-app-prio "fastpath restored: $saved"
+		uci -q set prio.main.saved_fastpath=''
+		uci -q commit prio
+	fi
+
+	# Keep $PRIO_STATE/shaper: reload() must not throw away the learned rate.
+	: > "$PRIO_STATE/status" 2>/dev/null
+	logger -t luci-app-prio "priority engine stopped"
+}
+
+reload() {
+	config_load prio
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" != 1 ]; then
+		stop
+		return 0
+	fi
+
+	local dev lan
+	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
+	lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"
+	[ -n "$dev" ] || config_get dev main wan_iface eth2
+	[ -n "$lan" ] || config_get lan main lan_iface br-lan
+	stop_detect
+	stop_refresh
+	# Do NOT delete the nft table or the qdiscs here. start() rebuilds both
+	# from scratch, but it can still bail out (disabled, wan == lan). Tearing
+	# down first and bailing out left the router with no queue at all while
+	# UCI said the feature was on.
+	if [ "$enabled" != 1 ]; then
+		stop
+		return 0
+	fi
+	acquire_lock || return 1
+	start
+	release_lock
+}
+
+# Called by the LuCI save hook with the state the user just submitted. The
+# hook can run while the commit is still landing, and reading the old value
+# made the engine follow the *previous* switch position (stop when turning it
+# on, and vice versa). Waiting for the file to agree removes that window
+# entirely instead of racing it.
+apply() {
+	local want="$1"
+	local i=0 cur
+	while [ "$i" -lt 10 ]; do
+		config_load prio
+		config_get_bool cur main enabled 0
+		[ "$cur" = "$want" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	reload
+}
+
+status() {
+	if [ -f "$PRIO_STATE/status" ] && grep -q started "$PRIO_STATE/status" 2>/dev/null; then
+		echo running
+		cat "$PRIO_STATE/status"
+	else
+		echo stopped
+	fi
+}
+
+# rc.common calls boot() instead of start() at system boot. Overriding it lets
+# us repair a stale saved_fastpath when the service is disabled: without this,
+# an interrupted run leaves turboacc pinned to flow_offloading forever.
+boot() {
+	config_load prio
+	if [ "$(state_get enabled)" != "1" ]; then
+		local saved
+		saved="$(state_get saved_fastpath)"
+		if [ -n "$saved" ]; then
+			uci -q set turboacc.config.fastpath="$saved"
+			uci -q commit turboacc
+			uci -q set prio.main.saved_fastpath=''
+			uci -q commit prio
+			/etc/init.d/c2000max-hnat reload >/dev/null 2>&1
+			logger -t luci-app-prio "boot: restored stale fastpath $saved"
+		fi
+		return 0
+	fi
+	start
+}

@@ -1,0 +1,24 @@
+
+config main 'main'
+	option enabled '0'
+	option auto_hnat_off '1'
+	option auto_bandwidth '1'
+	option bands '3'
+	option strict_bands '1'
+	option fq_codel '1'
+	option uplink '1'
+	option downlink '1'
+	option lan_shaping '0'
+	option lan_rate_kbit '0'
+	option wan_iface 'eth2'
+	option lan_iface 'br-lan'
+	option shaper_kbit '0'
+	option shaper_learned ''
+	option shaper_peak ''
+	option shaper_margin '10'
+	option rtt_target '223.5.5.5'
+	option saved_fastpath ''
+
+	# 0 = upload is not shaped. Set a value below the real upload rate
+	# to give the upload bands something to reorder.
+	option uplink_kbit '0'

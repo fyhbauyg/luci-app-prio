@@ -1,0 +1,355 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-prio\n"
+"PO-Revision-Date: 2026-11-16\n"
+"Last-Translator: congge\n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+msgid " -- the switch is on but the engine is not running; save once to re-apply"
+msgstr " —— 开关已打开但引擎没有运行，保存一次即可重新应用"
+
+msgid " (controller state unknown)"
+msgstr "（加速状态未知）"
+
+msgid " (leftover only)"
+msgstr "（只拿剩余）"
+
+msgid "%d level(s)"
+msgstr "%d 级"
+
+msgid "%d%% headroom"
+msgstr "留 %d%% 余量"
+
+msgid "(measured while the line was idle)"
+msgstr "（在线路空闲时测得）"
+
+msgid "0% (shape right at the line rate)"
+msgstr "0%（贴着线路速率）"
+
+msgid "10% (recommended)"
+msgstr "10%（推荐）"
+
+msgid "3 bands (recommended)"
+msgstr "3 个带（推荐）"
+
+msgid "4 bands"
+msgstr "4 个带"
+
+msgid "8 bands"
+msgstr "8 个带"
+
+msgid "Acceleration mode"
+msgstr "加速模式"
+
+msgid "Add fq_codel per band"
+msgstr "每个带内加 fq_codel"
+
+msgid "Adopt %d Mbit/s and stop learning"
+msgstr "采用 %d Mbps 并停止学习"
+
+msgid "Attention"
+msgstr "注意"
+
+msgid "Auto-learn downlink bandwidth"
+msgstr "自动学习下行带宽"
+
+msgid "Band"
+msgstr "带"
+
+msgid "Band %d"
+msgstr "带 %d"
+
+msgid "Band 0 has the absolute highest priority. The remaining bands share bandwidth fairly."
+msgstr "带 0 优先级最高，其余带之间公平分享带宽。"
+
+msgid "Band 0 is strictly prioritised; the other bands share bandwidth via DRR. Traffic is marked before NAT, so the classification applies to forwarded traffic. A shaper on the downlink path keeps a queue so the scheduler has something to reorder."
+msgstr "带 0 严格优先，其余带通过 DRR 共享带宽。数据包在 NAT 之前打标记，因此对转发流量同样生效。下行路径上加了整形器，保证队列里始终有包可供调度器重排。"
+
+msgid "Latency baseline"
+msgstr "延迟基线"
+
+msgid "Blank or 0 auto-detects the fastest wired port, falling back to 1000 Mbit/s."
+msgstr "留空或填 0 自动检测最快的网口速率，检测不到则按 1000 Mbit/s。"
+
+msgid "Built -- the shaper is holding traffic back, so priority is in effect"
+msgstr "已形成 —— 整形器正在压住流量，优先级生效中"
+
+msgid "Calibration"
+msgstr "校准"
+
+msgid "Calibration result"
+msgstr "校准结果"
+
+msgid "Calibration suggestion"
+msgstr "校准建议"
+
+msgid "Clears the remembered rate so the shaper measures the line again from scratch. Use it after an ISP upgrade or if the learned value looks wrong."
+msgstr "清除已记住的速率，让整形器重新从头测量线路。宽带升级后、或觉得学到的值不对时使用。"
+
+msgid "Detail"
+msgstr "详情"
+
+msgid "Device (IPv4)"
+msgstr "设备（IPv4）"
+
+msgid "Device Priority"
+msgstr "设备优先级"
+
+msgid "Device Priority List"
+msgstr "设备优先级列表"
+
+msgid "Disabled"
+msgstr "已禁用"
+
+msgid "Downlink FAILED"
+msgstr "下行整形失败"
+
+msgid "Downlink OK"
+msgstr "下行整形成功"
+
+msgid "Downlink only classified, no queue"
+msgstr "下行只做了分类，没有队列"
+
+msgid "Downlink rate (kbit/s)"
+msgstr "下行速率（kbit/s）"
+
+msgid "Downlink shaper"
+msgstr "下行整形器"
+
+msgid "Effective order"
+msgstr "实际生效顺序"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Enable Device Priority"
+msgstr "启用设备优先级"
+
+msgid "Engine"
+msgstr "优先级引擎"
+
+msgid "Forget the learned rate"
+msgstr "忘记已学到的速率"
+
+msgid "Give selected devices network priority. The downlink shaper limits the connection below the line's real speed so the router can queue and reorder packets; it learns that speed from real traffic, or you calibrate it once and use a fixed rate. Packets are marked before NAT so the classification survives address translation."
+msgstr "给选定的设备网络优先级。下行整形器会把连接限到线路真实带宽之下，路由器才有队列可以排序；这个速率可以由它自己从真实流量里学，也可以校准一次改用固定速率。数据包在 NAT 之前打标记，因此分类在地址转换后依然有效。"
+
+msgid "Global Settings"
+msgstr "全局设置"
+
+msgid "Hardware HNAT"
+msgstr "硬件 HNAT"
+
+msgid "Hardware HNAT bypasses the qdisc and would make priority useless. Software flow offloading keeps packets on the qdisc path."
+msgstr "硬件 HNAT 会绕过 qdisc，导致优先级失效。软件流量分载能让数据包继续走 qdisc。"
+
+msgid "How far below the measured capacity to run, in percent. Only the learned value is reduced; a rate typed in by hand is used exactly as typed. Bigger means a deeper local queue (priority bites harder) but less peak throughput. Adopting a calibration result switches to a fixed rate, where this has no effect."
+msgstr "在实测能力之下留多少余量，按百分比。只对自动学到的速率打折扣；手填的速率原样下发。数值越大，路由器里的队列越深、优先级越硬，但峰值带宽越少。注意：采用校准结果会切换成固定速率，那时这个值就不起作用了。"
+
+msgid "How it works"
+msgstr "工作原理"
+
+msgid "How many bands are absolutely prioritised, taken from band 0 upwards. The rest share the leftover bandwidth fairly, with no order between them. With 3 bands choose 2 for a real three-level priority."
+msgstr "有几个带享有绝对优先，从带 0 开始按序生效；其余带公平分享剩余带宽、彼此不分先后。三条带时选 2 即可得到真正的三级优先级。"
+
+msgid "Keeps one flow inside a band from starving the others."
+msgstr "防止同一个带内单条流把其他流饿死。"
+
+msgid "LAN Interface"
+msgstr "LAN 接口"
+
+msgid "LAN rate (kbit/s)"
+msgstr "局域网速率（kbit/s）"
+
+msgid "Latency probe target"
+msgstr "延迟探测目标"
+
+msgid "Marking OK"
+msgstr "打标记成功"
+
+msgid "No calibration has been run yet."
+msgstr "还没有运行过校准。"
+
+msgid "No downlink rate: without one there is no queue and priority does nothing. Enter a rate, or turn automatic learning back on."
+msgstr "没有下行速率：没有速率就不会形成队列，优先级完全不起作用。请填一个速率，或者把自动学习打开。"
+
+msgid "None -- traffic never queues, so the bands cannot reorder anything. The shaping rate is probably above what the line really delivers."
+msgstr "未形成 —— 流量从不排队，分档也就无法重排。塑形速率可能高于线路的真实能力。"
+
+msgid "Number of Priority Bands"
+msgstr "优先级带数量"
+
+msgid "OK"
+msgstr "正常"
+
+msgid "Off: LAN-to-LAN transfers are never queued or limited. On: the LAN class is shaped at the wired link speed, so local traffic also forms a queue."
+msgstr "关闭：局域网内部互传不排队、不限速。开启：局域网按有线网口速率整形，本地流量也会形成队列。"
+
+msgid "Only classification is installed, no queue yet -- priority is not in effect. Start a download so the rate can be learned, or set a fixed rate."
+msgstr "现在只装了分类规则，还没有队列 —— 优先级尚未生效。开一个下载让它学到速率，或者直接填一个固定速率。"
+
+msgid "Only the learned rate is reduced by this much; a manually entered rate is used exactly as typed. Shaping below the real line speed is what keeps the queue inside the router, so priority takes effect from the first packet instead of waiting for the ISP buffer to fill. The cost is that much peak throughput."
+msgstr "只有自动学到的速率会按这个比例打折；手动填写的速率按原值下发。塑形低于线路真实速率，队列才会留在路由器里，优先级才能从第一个包就生效，而不是等运营商的缓冲区先被填满。代价是峰值少这么多。"
+
+msgid "Pick a device or type its IPv4 address."
+msgstr "选择设备或直接输入它的 IPv4 地址。"
+
+msgid "Pick the closest hop automatically"
+msgstr "自动挑选最近的节点"
+
+msgid "Priority Band"
+msgstr "优先级带"
+
+msgid "Priority queue"
+msgstr "优先级队列"
+
+msgid "Queue LAN traffic too"
+msgstr "局域网也排队"
+
+msgid "Re-learn bandwidth"
+msgstr "重新学习带宽"
+
+msgid "Run calibration (about 3 minutes)"
+msgstr "运行校准（约 3 分钟）"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Running (queue rebuilding)"
+msgstr "运行中（队列重建中）"
+
+msgid "Runs one traceroute and uses the nearest hop that also answers a plain ping as the latency target. A hop inside your ISP shows your own access link's queue instead of the far end of the internet."
+msgstr "跑一次 traceroute，取运营商网络里最近一个既能被追踪、又能被 ping 通的节点作为探测目标。越靠近接入链路，测到的延迟越反映你自己这条线，而不是互联网远端。"
+
+msgid "Runtime Status"
+msgstr "运行状态"
+
+msgid "Safety margin"
+msgstr "安全余量"
+
+msgid "Safety margin (%)"
+msgstr "安全余量（%）"
+
+msgid "Saving applies immediately. Turning it off restores the previous acceleration mode."
+msgstr "保存后立即生效。关闭时恢复之前的加速模式。"
+
+msgid "Uplink rate (kbit/s)"
+msgstr "上行速率（kbit/s）"
+
+msgid "0 leaves the upload unshaped, which is the default: a 4G modem then buffers an upload inside itself and this router cannot reorder what it never queues. Enter a value below what the line really uploads at and the upload bands start to matter; from there the same latency controller adjusts it automatically."
+msgstr "填 0 表示上行不整形，这是默认值：4G 模组会把上传堆在自己内部，路由器连队列都看不到，自然排不了序。填一个低于线路真实上传能力的值，上传方向的分带才开始起作用；之后由同一个延迟控制器自动调节。"
+
+msgid "Shape Downlink (download)"
+msgstr "整形下行（下载）"
+
+msgid "Shape Uplink (upload)"
+msgstr "整形上行（上传）"
+
+msgid "Shaper %s"
+msgstr "整形速率 %s"
+
+msgid "Software flow offloading"
+msgstr "软件流量分载"
+
+msgid "Started"
+msgstr "已启动"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "Strict-priority levels"
+msgstr "严格优先层级数"
+
+msgid "Sweeps the shaping rate while a real download runs and records what the line actually delivers and how much latency it costs at each step. Start a download first. On a line whose speed swings a lot, the fixed rate this produces is steadier than the automatic estimate."
+msgstr "在真实下载期间逐档改变限速，记录每一档线路实际能跑多少、延迟有多高。请先开始下载再点。线路速度波动大的时候，用这里得到的固定速率比自动估算更稳。"
+
+msgid "Switches to a fixed rate equal to the calibrated value and turns automatic learning off. Re-run the calibration when the line changes."
+msgstr "切换成固定速率，数值就是校准得到的值，同时关掉自动学习。线路变化后重新校准一次即可。"
+
+msgid "The 4G/5G or external uplink interface."
+msgstr "4G/5G 或外网上联接口。"
+
+msgid "The learned rate is reduced by this much before it is applied. Shaping below the real line speed is what keeps the queue inside the router, so priority takes effect from the first packet instead of waiting for the ISP buffer to fill. The cost is that much peak throughput."
+msgstr "学到的速率会按这个比例打折后才下发。塑形低于线路真实速率，队列才会留在路由器里，优先级才能从第一个包就生效，而不是等运营商的缓冲区先被填满。代价是峰值少这么多。"
+
+msgid "The shaper learns the link rate from observed traffic instead of asking you to fill in a number."
+msgstr "整形器从实际流量中学习链路速率，无需手动填写数值。"
+
+msgid "While there is traffic the shaper watches the round trip to the probe target: near the idle baseline it raises the limit a little, blown up it lowers it. That keeps the queue on this router, which is what priority needs. It requires two things: the probe target must answer ping, and the link has to be idle once in a while so the baseline can be measured."
+msgstr "只要网里有流量，整形器就盯着到探测目标的往返延迟：接近空闲基线就略微提高限速，延迟被打爆就下调。这样队列会一直留在路由器里，优先级才有东西可排。它需要两个条件：探测目标能被 ping 通，以及线路偶尔空闲过（用来测基线）。"
+
+msgid "Uplink FAILED"
+msgstr "上行整形失败"
+
+msgid "Uplink OK"
+msgstr "上行整形成功"
+
+msgid "Use software flow offloading"
+msgstr "使用软件流量分载"
+
+msgid "Used by the calibration below to measure how much latency each rate costs. Pick a stable public address near you; an unreachable one makes the calibration table useless."
+msgstr "只在下面的校准里用，用来测每个限速档位各要付出多少延迟。建议填一个离你近、稳定的公网 IP；填了 ping 不通的地址，校准表就没有参考价值。"
+
+msgid "Used when auto-detection is off. 0 leaves the downlink unshaped."
+msgstr "关闭自动检测时使用。填 0 表示下行不整形。"
+
+msgid "WAN Interface"
+msgstr "WAN 接口"
+
+msgid "Where the downlink shaper is attached. Usually br-lan."
+msgstr "下行整形器挂载的接口，通常是 br-lan。"
+
+msgid "engine not running"
+msgstr "引擎未运行"
+
+msgid "estimate"
+msgstr "估计"
+
+msgid "hardware hook"
+msgstr "硬件钩子"
+
+msgid "headroom"
+msgstr "留"
+
+msgid "idle (no traffic in the last minute)"
+msgstr "空闲（最近一分钟没有流量）"
+
+msgid "kernel parameter"
+msgstr "内核参数"
+
+msgid "learned"
+msgstr "已学习"
+
+msgid "live"
+msgstr "实时"
+
+msgid "manual"
+msgstr "手动"
+
+msgid "not detected yet"
+msgstr "尚未检测到"
+
+msgid "off -- a fixed rate is used"
+msgstr "关闭 —— 正在使用固定速率"
+
+msgid "share equally"
+msgstr "平均分享"
+
+msgid "unknown (no traffic seen yet)"
+msgstr "未知（还没有看到流量）"
+
+msgid "not measured yet -- it is taken at a moment with no traffic"
+msgstr "还没测到 —— 它会在线路空闲的那一刻读取基线"
+
+msgid "None -- only classification is installed, no queue"
+msgstr "没有队列 —— 只装了分类规则，下行未整形"
+
+msgid "Enabled"
+msgstr "已开启"
+
+msgid "This is a local address: pinging it measures your own network, not the line. Use a public address."
+msgstr "这是内网地址：ping 它测到的是你自己的局域网，不是线路。请填公网地址。"

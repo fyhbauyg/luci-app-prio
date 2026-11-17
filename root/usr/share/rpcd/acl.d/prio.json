@@ -1,0 +1,29 @@
+{
+	"luci-app-prio": {
+		"description": "Grant access to Device Priority",
+		"read": {
+			"file": {
+				"/etc/config/prio": [ "read" ],
+				"/var/run/luci-app-prio/status": [ "read" ],
+				"/var/run/luci-app-prio/err": [ "read" ],
+				"/var/run/luci-app-prio/shaper": [ "read" ],
+				"/tmp/dhcp.leases": [ "read" ],
+				"/sys/kernel/debug/hnat/hook_toggle": [ "read" ]
+			},
+			"ubus": {
+				"uci": [ "prio", "turboacc", "dhcp" ],
+				"service": [ "prio" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/etc/config/prio": [ "write" ],
+				"/etc/init.d/prio": [ "write", "exec" ]
+			},
+			"ubus": {
+				"uci": [ "prio", "turboacc" ],
+				"service": [ "prio" ]
+			}
+		}
+	}
+}
