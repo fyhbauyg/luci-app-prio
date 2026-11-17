@@ -1359,25 +1359,10 @@ start_detect() {
 	logger -t luci-app-prio "bandwidth auto-detect started on $dev (capacity peak, pid $(cat "$DETECT_PID"))"
 }
 
-# ---------------------------------------------------------------------------
-# Calibration: sweep the rate while a real download runs and print what the
-# line actually delivers and how much latency it costs at each step. Open loop
-# on purpose -- no feedback, no oscillation, just measurements you can pick a
-# working point from.
-# ---------------------------------------------------------------------------
-ifrate() {
-	local dev="$1" secs="${2:-4}" a b
-	a=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
-	sleep "$secs"
-	b=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
-	case "$a$b" in ''|*[!0-9]*) echo 0 ;; *) echo $(( (b - a) * 8 / 1000 / secs )) ;; esac
-}
-
-# Throughput that actually crossed the shaped class, in kbit/s. ifrate() above
-# counts bytes arriving on WAN, which is the *offer*: packets the shaper will
-# drop, retransmissions and other clients are all in it, so it can never prove
-# that a given rate was the bottleneck. This one is read after the queue.
-
+# Class throughput is read from the qdisc's own overlimit counter
+# (htb_overlimits below), not from interface counters: rx_bytes on WAN is the
+# *offer* -- packets the shaper will drop, retransmissions and other clients
+# are all in it -- so it can never prove that a given rate was the bottleneck.
 
 # The closer the probe target, the cleaner the signal: a hop inside the ISP's
 # own network shows the access link's queue immediately, while a far target

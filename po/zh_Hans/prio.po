@@ -360,14 +360,14 @@ msgstr "最近一次测量"
 msgid "Measure now (up to a minute on a slow line)"
 msgstr "立即测量（线路慢时最多约 1 分钟）"
 
-msgid "Only used when "Measure the line automatically" is off. 0 leaves the downlink unshaped."
+msgid "Only used when \"Measure the line automatically\" is off. 0 leaves the downlink unshaped."
 msgstr "只在关掉「自动测量线路容量」时生效。填 0 表示下行不限速。"
-
-msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. With "Measure the line automatically" on and the line idle, a successful run replaces the remembered rate; that is also what to press when the line itself changed and has to be learned again."
-msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率——线路本身变了要重新学，也是按这个按钮。"
 
 msgid "lowest band, band %d (recommended)"
 msgstr "最低带，带 %d（推荐）"
 
-msgid "nothing queued right now -- no traffic is waiting, so there is nothing to reorder at this moment. This is a live reading, not a fault."
-msgstr "此刻没有排队——现在没有流量在队列里等着，所以这一瞬间没有包可重排。这是实时读数，不是故障。"
+msgid "no local backlog in the last window -- traffic never exceeded the shaping rate. Normal on a quiet line; also what a rate set above the line's real capacity looks like."
+msgstr "上一窗口内本地没有积压——流量一直没超过整形速率。线路空闲时这是正常的，但整形速率高于线路真实能力时也是这个样子。"
+
+msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
+msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。如果上一次测量至少有 5 Mbit/s，一天之内低于它一半的结果会被忽略，这样一次被限速的测速不会把速率钉死；真的降速了得等过这一天，或者关掉自动测量手动填速率。"

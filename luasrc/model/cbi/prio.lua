@@ -246,11 +246,16 @@ o.cfgvalue = function()
 		return translate("Built -- the shaper is holding traffic back, so priority is in effect")
 	end
 	if st == "none" then
-		-- A live reading, not a verdict: with no backlog there is nothing to
-		-- reorder, which is what an idle line looks like. Saying "no queue was
-		-- ever built" here contradicted the "Downlink OK" row right below it.
-		return translate("nothing queued right now -- no traffic is waiting, so there is " ..
-			"nothing to reorder at this moment. This is a live reading, not a fault.")
+		-- "none" is written when traffic went through but never exceeded the
+		-- shaping rate in that window. That is normal on a quiet line, but it
+		-- is also what a rate set above the line's real capacity looks like,
+		-- so it must not read as a verdict in either direction.
+		if not htb_present() then
+			return translate("None -- only classification is installed, no queue")
+		end
+		return translate("no local backlog in the last window -- traffic never exceeded " ..
+			"the shaping rate. Normal on a quiet line; also what a rate set above the " ..
+			"line's real capacity looks like.")
 	end
 	if st == "idle" then
 		return translate("idle (no traffic in the last minute)")
@@ -363,8 +368,10 @@ o.description = translate("Uses the built-in speedtest client: it picks a mainla
 	"(Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the " ..
 	"line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. " ..
 	"With \"Measure the line automatically\" on and the line idle, a successful run " ..
-	"replaces the remembered rate; that is also what to press when the line itself " ..
-	"changed and has to be learned again.")
+	"replaces the remembered rate. A result under half of the previous one within a " ..
+	"day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled " ..
+	"test cannot pin the line; a genuine downgrade needs that day to pass, or switch " ..
+	"automatic measurement off and type the rate in by hand.")
 o.write = function()
 	-- One measurement, not two. This used to run it inline and then again in a
 	-- background subshell, which charged the line for two full runs.
@@ -379,10 +386,9 @@ o.rmempty = false
 o = s:option(Value, "shaper_kbit", translate("Downlink rate (kbit/s)"))
 o.datatype = "uinteger"
 o.placeholder = "15000"
--- Hidden while the line is measured: the stored number is inert then, and
--- leaving 100000 in the box next to "shaper: 338.2 Mbit/s" looks like a
--- contradiction rather than an unused field.
-o:depends("auto_bandwidth", "0")
+-- Stays visible on purpose. Hiding it with o:depends made CBI drop the field
+-- from the POST, and because rmempty is true the save then DELETED the user's
+-- manual rate -- switching automatic measurement on once lost it for good.
 o.description = translate("Only used when \"Measure the line automatically\" is off. " ..
 	"0 leaves the downlink unshaped.")
 
