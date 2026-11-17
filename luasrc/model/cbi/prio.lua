@@ -3,6 +3,10 @@ local m, s, o, d, i
 local uci = require "luci.model.uci".cursor()
 local fs = require "nixio.fs"
 local sys = require "luci.sys"
+-- luci.http: the auto-refresh row has to know whether this request is the
+-- "Measure now" POST, because the marker is created by a detached child that
+-- has not started yet when this model is loaded.
+local http = require "luci.http"
 
 local function str(v)
 	return type(v) == "string" and v or ""
@@ -409,6 +413,38 @@ o.cfgvalue = function()
 	local age = t0 > 0 and ago(t0) or ""
 	if age ~= "" then text = text .. "  ·  " .. age end
 	return text .. note
+end
+
+-- While a measurement is running the page reloads itself, so the user does not
+-- have to guess when to hit F5. Nothing is added to an idle page: the row is
+-- created only for a reload during a live measurement, or for the button's own
+-- POST (CBI loads the model BEFORE it runs the write handler, so at that moment
+-- the marker does not exist yet and only the submitted field proves it).
+local refresh_now = false
+local mst = fs.stat("/var/run/luci-app-prio/measuring")
+if mst and mst.mtime and (os.time() - mst.mtime) < 120 then
+	refresh_now = true
+elseif http.getenv("REQUEST_METHOD") == "POST" and
+       http.formvalue("cbid.prio.main._measure") ~= nil then
+	refresh_now = true
+end
+if refresh_now then
+	o = s:option(DummyValue, "_measuring_now", "")
+	o.rawhtml = true
+	o.cfgvalue = function()
+		-- location.reload() is wrong here: this page is a POST result, and
+		-- reloading it re-sends the form, which runs the button's write handler
+		-- again and starts another 300 MB measurement. Navigate with a GET
+		-- instead. The counter rides in the query string because a counter kept
+		-- in the page is reset by the very reload it is supposed to limit.
+		-- The row stays empty on screen: the row above already says what is
+		-- happening, and an unlabelled row with no content costs no space.
+		return "<script>(function(){var m=/[?&]_r=(\\d+)/.exec(location.search)," ..
+			"n=m?+m[1]:0;if(n>=12)return;var q=location.search.replace(/[?&]_r=\\d+/,'')," ..
+			"sep=q.indexOf('?')===0?'&':'?';" ..
+			"setTimeout(function(){location.href=location.pathname+q+sep+'_r='+(n+1);},8000);" ..
+			"})();</script>"
+	end
 end
 
 o = s:option(Button, "_measure", translate("Measured capacity"))
