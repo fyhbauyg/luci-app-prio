@@ -51,7 +51,15 @@ rate_kbit() {
 }
 echo "      下行实际 $(rate_kbit $LAN) kbit，上行实际 $(rate_kbit $WAN) kbit"
 DOWNREAL=$(rate_kbit $LAN); case "$DOWNREAL" in ''|*[!0-9]*) DOWNREAL=0 ;; esac
-SHEST=$(cat $ST/shaper 2>/dev/null); case "$SHEST" in ''|*[!0-9]*) SHEST=0 ;; esac
+# With automatic learning off the rate comes straight from the config and the
+# controller never writes the estimate file, so compare against the right one.
+AUTO=$(uci -q get prio.main.auto_bandwidth)
+if [ "$AUTO" = "1" ]; then
+	SHEST=$(cat $ST/shaper 2>/dev/null)
+else
+	SHEST=$(uci -q get prio.main.shaper_kbit)
+fi
+case "$SHEST" in ''|*[!0-9]*) SHEST=0 ;; esac
 chk "下行速率 >= 2000 kbit" "[ $DOWNREAL -ge 2000 ]"
 if [ "$SHEST" -ge 2000 ] && [ "$DOWNREAL" -ge 2000 ]; then
 	PCT=$(( DOWNREAL * 100 / SHEST ))

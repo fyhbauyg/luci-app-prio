@@ -327,14 +327,16 @@ o.rmempty = false
 o.description = translate("Hardware HNAT bypasses the qdisc and would make priority useless. " ..
 	"Software flow offloading keeps packets on the qdisc path.")
 
-o = s:option(Flag, "auto_bandwidth", translate("Auto-learn downlink bandwidth"))
-o.default = 1
+o = s:option(Flag, "auto_bandwidth", translate("Auto-learn downlink bandwidth (experimental)"))
+o.default = 0
 o.rmempty = false
 o.description = translate("While there is traffic the shaper watches the round trip to " ..
 	"the probe target: near the idle baseline it raises the limit a little, blown up it " ..
-	"lowers it. That keeps the queue on this router, which is what priority needs. It " ..
-	"requires two things: the probe target must answer ping, and the link has to be idle " ..
-	"once in a while so the baseline can be measured.")
+	"lowers it. That keeps the queue on this router, which is what priority needs. " ..
+	"It needs a probe target that answers ping and an idle window for the baseline, " ..
+	"and it cannot tell our own queue from the modem's, so it only ever finds the " ..
+	"line's capacity approximately. Measured fixed rates are steadier: run a " ..
+	"speedtest and enter about 85% of what it reports.")
 
 o = s:option(Value, "rtt_target", translate("Latency probe target"))
 o.default = "223.5.5.5"

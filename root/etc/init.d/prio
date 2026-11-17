@@ -788,7 +788,7 @@ rtt_avg_ms() {
 	local target out
 	target="$(state_get rtt_target)"
 	[ -n "$target" ] || target=223.5.5.5
-	out="$(ping -c 4 -W 1 "$target" 2>/dev/null | \
+	out="$(ping -c 4 -W 2 "$target" 2>/dev/null | \
 		awk -F'= ' '/round-trip/{split($2,a,"/"); print int(a[2]+0); exit}')"
 	case "$out" in ''|*[!0-9]*) echo 0 ;; *) echo "$out" ;; esac
 }
@@ -801,7 +801,7 @@ rtt_all_ms() {
 	local target out tx rx
 	target="$(state_get rtt_target)"
 	[ -n "$target" ] || target=223.5.5.5
-	out="$(ping -c 4 -W 1 "$target" 2>/dev/null)"
+	out="$(ping -c 4 -W 2 "$target" 2>/dev/null)"
 	# No leading space: busybox and iputils both print "4 packets transmitted"
 	# at the start of the line, so the old '.* ' pattern never matched and this
 	# function returned 0 every single time -- which silently disabled uplink
@@ -1129,11 +1129,15 @@ start_detect() {
 					case "$ug" in ''|*[!0-9]*) ug=0 ;; esac
 					if [ "$urtt" -eq 0 ]; then
 						newup=$(( up * 85 / 100 ))
-					elif [ "$base" -gt 0 ] && [ "$urtt" -gt $(( base + 300 )) ]; then
-						# same bounds as the downlink: at least -15%, at most -30%
-						newup=$(( up * (base + 40) / urtt ))
-						[ "$newup" -gt $(( up * 85 / 100 )) ] && newup=$(( up * 85 / 100 ))
-						[ "$newup" -lt $(( up * 70 / 100 )) ] && newup=$(( up * 70 / 100 ))
+					elif { [ "$base" -gt 0 ] && [ "$urtt" -gt $(( base + 300 )) ]; } ||
+					     { [ "$base" -eq 0 ] && [ "$urtt" -gt 200 ]; }; then
+						# same proportional cut as the downlink
+						uex=$(( urtt - base ))
+						[ "$base" -eq 0 ] && uex=$urtt
+						ustep=$(( 10 + (uex - 300) / 40 ))
+						[ "$ustep" -gt 30 ] && ustep=30
+						[ "$ustep" -lt 10 ] && ustep=10
+						newup=$(( up * (100 - ustep) / 100 ))
 						[ "$ug" -gt "$up" ] && printf '%s\n' "$up" > "$PRIO_STATE/up_good"
 					elif [ "$ubind" = 1 ] && [ "$base" -gt 0 ] && [ "$urtt" -le $(( base + 150 )) ]; then
 						if [ "$up" -gt "$ug" ]; then
@@ -1191,9 +1195,25 @@ start_detect() {
 				downmiss=0
 				clear_probe_down
 			fi
+			bind=0
+			if [ "$applied" -ge 1000 ] && [ $(( thr * 100 )) -ge $(( applied * 80 )) ]; then
+				bind=1
+			fi
 			if [ "$downmiss" -ge 3 ]; then
 				grep -q 'probe:down' "$PRIO_STATE/status" 2>/dev/null ||
 					echo "probe:down" >> "$PRIO_STATE/status"
+				# A dead target and a modem queued past the probe timeout look
+				# identical: no answer at all. Freezing is only safe when the
+				# traffic says the cap is NOT binding; if the download is
+				# running at the cap and nothing answers, that is the queue.
+				if [ "$bind" = 1 ]; then
+					newrate=$(( rate * 90 / 100 ))
+					[ "$newrate" -lt 2000 ] && newrate=2000
+					if apply_downlink_rate "$lan" "$bands" "$newrate"; then
+						printf '%s\n' "$newrate" > "$PRIO_STATE/shaper"
+						logger -t luci-app-prio "rate ${rate} -> ${newrate}kbit (probe unanswered at the cap)"
+					fi
+				fi
 				continue
 			fi
 			newrate=$rate
@@ -1210,29 +1230,23 @@ start_detect() {
 			# A "binding" test was tried and rejected: with the real capacity
 			# below the applied rate the measured throughput can never reach
 			# 80% of it, so the gate stayed closed and the rate never came down.
-			# "Is the shaper limiting this window" gates the RAISE only. It is
-			# the right question for a raise (with 3 Mbit flowing through a
-			# 144 Mbit cap there is no local queue, the latency is just cell
-			# jitter, and raising would walk the cap to the ceiling without
-			# ever shaping anything). It is the wrong question for a cut: when
-			# the real capacity drops below the applied rate the measured
-			# throughput can never reach 80% of it, so gating the cut on the
-			# same test freezes the rate above capacity forever.
-			bind=0
-			if [ "$applied" -ge 1000 ] && [ $(( thr * 100 )) -ge $(( applied * 80 )) ]; then
-				bind=1
-			fi
 			rg=$(cat "$PRIO_STATE/rate_good" 2>/dev/null)
 			case "$rg" in ''|*[!0-9]*) rg=0 ;; esac
 			if [ "$rtt" -eq 0 ]; then
 				newrate=$(( rate * 80 / 100 ))
-			elif [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 300 )) ]; then
-				# Proportional, but bounded on both sides: at least -15% and at
-				# most -30% in one window. The old unbounded ratio turned one
-				# 188 ms sample into a 71% cut.
-				newrate=$(( rate * (base + 40) / rtt ))
-				[ "$newrate" -gt $(( rate * 85 / 100 )) ] && newrate=$(( rate * 85 / 100 ))
-				[ "$newrate" -lt $(( rate * 70 / 100 )) ] && newrate=$(( rate * 70 / 100 ))
+			elif { [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 300 )) ]; } ||
+			     { [ "$base" -eq 0 ] && [ "$rtt" -gt 200 ]; }; then
+				# Cut in proportion to how far the queue sits beyond the
+				# baseline: -10% for a small overshoot, -30% for a blown-up one.
+				# The previous ratio was a constant -30% for every base below
+				# ~567 ms (the ratio could never exceed 0.70), which made the
+				# loop a bang-bang oscillator instead of a controller.
+				ex=$(( rtt - base ))
+				[ "$base" -eq 0 ] && ex=$rtt
+				step=$(( 10 + (ex - 300) / 40 ))
+				[ "$step" -gt 30 ] && step=30
+				[ "$step" -lt 10 ] && step=10
+				newrate=$(( rate * (100 - step) / 100 ))
 				# The rate that just failed is the ceiling for the memory: it
 				# used to be decayed to 1.5x of the PRE-cut rate, which stopped
 				# falling after the first cut and left a stale high value.

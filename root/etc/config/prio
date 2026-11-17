@@ -2,7 +2,10 @@
 config main 'main'
 	option enabled '0'
 	option auto_hnat_off '1'
-	option auto_bandwidth '1'
+	# 0 = use shaper_kbit / uplink_kbit as they are. 1 = let the latency loop
+	# adjust the downlink rate. The loop is still experimental: measure the
+	# line once and type the number in if you want predictable behaviour.
+	option auto_bandwidth '0'
 	option bands '3'
 	option strict_bands '1'
 	option fq_codel '1'

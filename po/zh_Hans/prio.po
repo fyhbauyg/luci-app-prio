@@ -380,3 +380,9 @@ msgstr "延迟探测目标没有回应，速率被保持在最后一次的值上
 
 msgid "Enter a whole number in kbit/s, or 0 for automatic."
 msgstr "请填整数（kbit/s），或填 0 表示自动。"
+
+msgid "Auto-learn downlink bandwidth (experimental)"
+msgstr "自动学习下行带宽（实验性）"
+
+msgid "While there is traffic the shaper watches the round trip to the probe target: near the idle baseline it raises the limit a little, blown up it lowers it. That keeps the queue on this router, which is what priority needs. It needs a probe target that answers ping and an idle window for the baseline, and it cannot tell our own queue from the modem's, so it only ever finds the line's capacity approximately. Measured fixed rates are steadier: run a speedtest and enter about 85% of what it reports."
+msgstr "有流量时会盯着到探测目标的往返时间：接近空闲基线就略微上调限速，明显变大就下调。这样队列才会留在本路由器上，优先级才有东西可排。前提是探测目标能 ping 通、并且偶尔有线路空闲的时刻来测基线；它也分不清"排队在我们自己这里"和"排队在模组里"，所以只能大致逼近线路容量。实测后填固定速率会更稳：跑一次测速，填它报的 85% 左右。"
