@@ -449,3 +449,15 @@ msgstr "挑选探测目标"
 
 msgid "How far below the measured capacity to run, in percent. Only the measured value is reduced; a rate typed in by hand is used exactly as typed. Bigger means a deeper local queue (priority bites harder) but less peak throughput."
 msgstr "在实测能力之下留多少余量，按百分比。只对测量出来的值打折；手填的速率原样下发。数值越大，路由器里的队列越深、优先级越硬，但峰值带宽越少。"
+
+msgid "Measure now (takes about 15 seconds)"
+msgstr "立即测量（约 15 秒）"
+
+msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line."
+msgstr "使用固件自带的测速客户端：自动挑选大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的速度。会消耗真实流量 —— 快线上大约 300 MB。"
+
+msgid "Capacity is measured, not guessed: the router downloads and uploads through its own unshaped path (using the built-in speedtest on a mainland node) and the shaper runs at that value minus the safety margin. The latency loop may only LOWER the rate afterwards, never raise it, because a round trip tells you that there is a queue but never how many bits fit."
+msgstr "容量是测出来的，不是猜的：路由器用自己的免整形通道（固件自带的测速客户端、大陆节点）实测一次，限速就设在这个值减去安全余量上。之后延迟环路只能把速率往下调，永远不会往上调 —— 往返时间只能告诉你"有队列"，永远告诉不了你"能装多少比特"。"
+
+msgid "Last measurement"
+msgstr "最近一次测量"

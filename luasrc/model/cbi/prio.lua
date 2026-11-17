@@ -331,12 +331,12 @@ o = s:option(Flag, "auto_bandwidth", translate("Measure the line automatically")
 o.default = 1
 o.rmempty = false
 o.description = translate("Capacity is measured, not guessed: the router downloads and " ..
-	"uploads through its own unshaped path for a few seconds (on start and every " ..
-	"half hour), and the shaper runs at that value minus the safety margin. The " ..
+	"uploads through its own unshaped path (using the built-in speedtest on a mainland " ..
+	"node) and the shaper runs at that value minus the safety margin. The " ..
 	"latency loop may only LOWER the rate afterwards, never raise it, because a " ..
 	"round trip tells you that there is a queue but never how many bits fit.")
 
-o = s:option(DummyValue, "_measured", translate("Measured capacity"))
+o = s:option(DummyValue, "_measured", translate("Last measurement"))
 o.cfgvalue = function()
 	local function num(v) return tonumber(v or "") or 0 end
 	local ok1, dl = pcall(function() return uci:get("prio", "main", "measured_dl") end)
@@ -360,10 +360,11 @@ o.cfgvalue = function()
 end
 
 o = s:option(Button, "_measure", translate("Measured capacity"))
-o.inputtitle = translate("Measure now (takes about 10 seconds)")
+o.inputtitle = translate("Measure now (takes about 15 seconds)")
 o.inputstyle = "reload"
-o.description = translate("Downloads and uploads for a few seconds through the router " ..
-	"itself and records what the line actually delivered.")
+o.description = translate("Uses the built-in speedtest client: it picks a mainland node " ..
+	"(Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the " ..
+	"line actually delivered. It costs real traffic -- roughly 300 MB on a fast line.")
 o.write = function()
 	require("luci.sys").call("/etc/init.d/prio measure >/dev/null 2>&1")
 	require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")

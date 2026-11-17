@@ -1020,9 +1020,18 @@ start_detect() {
 			# make the controller cut the rate the measurement is about to
 			# establish.
 			if [ -f "$PRIO_STATE/measuring" ]; then
-				thr=0
-				thr_up=0
-				continue
+				mmage=$(( $(date +%s) - $(date -r "$PRIO_STATE/measuring" +%s 2>/dev/null || echo 0) ))
+				# Only measure() used to drop a stale marker, and every path that
+				# starts a measurement waits for the marker to be gone: a
+				# measurement killed with SIGKILL froze the whole control loop
+				# until the next reboot. The loop drops it instead.
+				if [ "$mmage" -gt 120 ]; then
+					rm -f "$PRIO_STATE/measuring"
+				else
+					thr=0
+					thr_up=0
+					continue
+				fi
 			fi
 			lm=$(cat "$PRIO_STATE/last_measure" 2>/dev/null)
 			case "$lm" in ''|*[!0-9]*) lm=0 ;; esac
@@ -1279,6 +1288,8 @@ start_detect() {
 				continue
 			fi
 			newrate=$rate
+			mref0=$(state_get measured_dl)
+			case "$mref0" in ''|*[!0-9]*) mref0=0 ;; esac
 			# Two thresholds, a wide band between them, and no "is the shaper
 			# the bottleneck" gate:
 			#  * below knee_lo the round trip is the cell's normal jitter,
@@ -1295,7 +1306,8 @@ start_detect() {
 			if [ "$rtt" -eq 0 ]; then
 				newrate=$(( rate * 80 / 100 ))
 			elif { [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 300 )) ]; } ||
-			     { [ "$base" -eq 0 ] && [ "$rtt" -gt 200 ]; }; then
+			     { [ "$base" -eq 0 ] && [ "$rtt" -gt 200 ] &&
+			       { [ "$mref0" -lt 1000 ] || [ "$rate" -gt $(( mref0 * 4 / 10 )) ]; }; }; then
 				# If the estimate has fallen far below what the line last
 				# measured, this is not a transient queue any more: schedule a
 				# fresh measurement (rate limited to once per 10 minutes).
@@ -1435,7 +1447,8 @@ EOF
 # away when the queue appears.
 # ---------------------------------------------------------------------------
 measure() {
-	local dev dl_url ul_url secs a b dl ul f pid rc
+	local dev dl_url ul_url secs a b dl ul f p1 p2 p3 p4
+	local method node lat
 	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
 	[ -n "$dev" ] || dev="$(state_get wan_iface)"
 	[ -n "$dev" ] || dev=eth2
@@ -1444,12 +1457,27 @@ measure() {
 	ul_url="$(state_get measure_up_url)"
 	[ -n "$ul_url" ] || ul_url="https://speed.cloudflare.com/__up"
 	secs="$(state_get measure_secs)"
-	case "$secs" in ''|*[!0-9]*) secs=6 ;; esac
+	case "$secs" in ''|*[!0-9]*) secs=5 ;; esac
 	[ "$secs" -lt 2 ] && secs=2
 	[ "$secs" -gt 15 ] && secs=15
+	method="$(state_get measure_method)"
+	[ -n "$method" ] || method=auto
 
-	command -v curl >/dev/null 2>&1 || { echo "measure:no-curl"; return 1; }
 	[ -e "/sys/class/net/$dev/statistics/rx_bytes" ] || { echo "measure:no-iface"; return 1; }
+
+	# Two measurements at once would each see the other's traffic; the marker
+	# also tells the detector to ignore its window. It is cleaned by a trap:
+	# leaving it behind (this function is the only unguarded one in the script)
+	# stops the control loop entirely until the next successful measurement or
+	# a reboot, because the detector skips every window while it exists.
+	if [ -f "$PRIO_STATE/measuring" ]; then
+		local mage
+		mage=$(( $(date +%s) - $(date -r "$PRIO_STATE/measuring" +%s 2>/dev/null || echo 0) ))
+		# a marker older than this cannot belong to a live measurement
+		[ "$mage" -gt 120 ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; return 1; }
+	fi
+	: > "$PRIO_STATE/measuring"
+	trap 'rm -f "$PRIO_STATE/measuring"; : > /tmp/.prio-measure-up 2>/dev/null; : > /tmp/.prio-cnspeed.json 2>/dev/null' EXIT INT TERM
 
 	# Only measure an idle line. The counters are per-interface, so any other
 	# client using the link at the same time lands in the same sum -- measuring
@@ -1469,85 +1497,108 @@ measure() {
 		;;
 	esac
 
-	# Two measurements at once would each see the other's traffic; the marker
-	# also tells the detector to ignore its window. It is cleaned by a trap:
-	# leaving it behind (this function is the only unguarded one in the script)
-	# stops the control loop entirely until the next successful measurement or
-	# a reboot, because the detector skips every window while it exists.
-	if [ -f "$PRIO_STATE/measuring" ]; then
-		local mage
-		mage=$(( $(date +%s) - $(date -r "$PRIO_STATE/measuring" +%s 2>/dev/null || echo 0) ))
-		# a marker older than this cannot belong to a live measurement
-		[ "$mage" -gt 120 ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; return 1; }
+	dl=0; ul=0; node=""
+	# Preferred source: the CN speedtest client this firmware already ships
+	# (cnspeedtest). It discovers a mainland node -- Guangzhou/Shenzhen Unicom
+	# here -- and runs 8 parallel TCP streams, which is what makes the number
+	# usable: the mirror + Cloudflare combination the script used before crosses
+	# an international path and reported 185/35 Mbit on a line that this tool
+	# measures at 395-505 down and 100-112 up.
+	if [ "$method" != "http" ] && [ -x /usr/bin/cnspeedtest ] && command -v jq >/dev/null 2>&1; then
+		f=/tmp/.prio-cnspeed.json
+		if timeout $(( secs * 4 + 40 )) /usr/bin/cnspeedtest -web=false -json \
+			-duration "${secs}s" -download-threads 8 -upload-threads 4 > "$f" 2>/dev/null &&
+			[ -s "$f" ]; then
+			dl=$(jq -r '.download.AvgMbps // 0' "$f" 2>/dev/null)
+			ul=$(jq -r '.upload.AvgMbps // 0' "$f" 2>/dev/null)
+			node=$(jq -r '.node.name // ""' "$f" 2>/dev/null)
+			lat=$(jq -r '.latency_ms.avg // 0' "$f" 2>/dev/null)
+			dl=$(awk -v v="${dl:-0}" 'BEGIN{printf "%d", v*1000}')
+			ul=$(awk -v v="${ul:-0}" 'BEGIN{printf "%d", v*1000}')
+		fi
+		: > "$f"
 	fi
-	: > "$PRIO_STATE/measuring"
-	trap 'rm -f "$PRIO_STATE/measuring"; : > /tmp/.prio-measure-up 2>/dev/null' EXIT INT TERM
 
-	# --- download ---
-	# Start the transfer first and only then start counting: the first second
-	# is TCP slow start, and timing it as if it were the line made a 185 Mbit
-	# link measure as 65 Mbit.
-	local p1 p2 p3 p4
-	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p1=$!
-	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p2=$!
-	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p3=$!
-	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p4=$!
-	sleep 3
-	a=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
-	case "$a" in ''|*[!0-9]*) a=0 ;; esac
-	sleep "$secs"
-	kill "$p1" "$p2" "$p3" "$p4" 2>/dev/null
-	wait 2>/dev/null
-	b=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
-	case "$b" in ''|*[!0-9]*) b=0 ;; esac
-	if [ "$b" -gt "$a" ]; then dl=$(( (b - a) * 8 / 1000 / secs )); else dl=0; fi
+	if [ "${dl:-0}" -lt 1000 ] && [ "${ul:-0}" -lt 1000 ]; then
+		# Fallback: plain HTTP through this router's own unshaped path.
+		method=http
+		# --- download ---
+		# Start the transfer first and only then start counting: the first second
+		# is TCP slow start, and timing it as if it were the line made a 185 Mbit
+		# link measure as 65 Mbit.
+		curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p1=$!
+		curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p2=$!
+		curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p3=$!
+		curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p4=$!
+		sleep 3
+		a=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+		case "$a" in ''|*[!0-9]*) a=0 ;; esac
+		sleep "$secs"
+		kill "$p1" "$p2" "$p3" "$p4" 2>/dev/null
+		wait 2>/dev/null
+		b=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+		case "$b" in ''|*[!0-9]*) b=0 ;; esac
+		if [ "$b" -gt "$a" ]; then dl=$(( (b - a) * 8 / 1000 / secs )); else dl=0; fi
 
-	# --- upload ---
-	f=/tmp/.prio-measure-up
-	dd if=/dev/zero of="$f" bs=1048576 count=12 2>/dev/null
-	curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p1=$!
-	curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p2=$!
-	curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p3=$!
-	ut0=$(date +%s)
-	sleep 3
-	a=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
-	case "$a" in ''|*[!0-9]*) a=0 ;; esac
-	at=$(date +%s)
-	# Wait for the window, but stop early when the transfers are done: the
-	# three flows carry a fixed amount of data, and on a fast line they finish
-	# long before the window ends. Dividing that amount by the window (instead
-	# of by the time it actually took) reported 10 Mbit on an 80 Mbit link.
-	waitn=0
-	while [ "$waitn" -lt "$secs" ]; do
-		sleep 1
-		waitn=$(( waitn + 1 ))
-		kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null || kill -0 "$p3" 2>/dev/null || break
-	done
-	bt=$(date +%s)
-	kill "$p1" "$p2" "$p3" 2>/dev/null
-	wait 2>/dev/null
-	b=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
-	case "$b" in ''|*[!0-9]*) b=0 ;; esac
-	uel=$(( bt - at ))
-	[ "$uel" -lt 1 ] && uel=1
-	if [ "$b" -gt "$a" ]; then ul=$(( (b - a) * 8 / 1000 / uel )); else ul=0; fi
-	: > "$f"
+		# --- upload ---
+		f=/tmp/.prio-measure-up
+		dd if=/dev/zero of="$f" bs=1048576 count=12 2>/dev/null
+		curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p1=$!
+		curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p2=$!
+		curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p3=$!
+		sleep 3
+		a=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+		case "$a" in ''|*[!0-9]*) a=0 ;; esac
+		at=$(date +%s)
+		# Wait for the window, but stop early when the transfers are done: the
+		# three flows carry a fixed amount of data, and on a fast line they
+		# finish long before the window ends. Dividing that amount by the window
+		# (instead of by the time it actually took) reported 10 Mbit on an 80
+		# Mbit link.
+		waitn=0
+		while [ "$waitn" -lt "$secs" ]; do
+			sleep 1
+			waitn=$(( waitn + 1 ))
+			kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null || kill -0 "$p3" 2>/dev/null || break
+		done
+		bt=$(date +%s)
+		kill "$p1" "$p2" "$p3" 2>/dev/null
+		wait 2>/dev/null
+		b=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+		case "$b" in ''|*[!0-9]*) b=0 ;; esac
+		uel=$(( bt - at ))
+		[ "$uel" -lt 1 ] && uel=1
+		if [ "$b" -gt "$a" ]; then ul=$(( (b - a) * 8 / 1000 / uel )); else ul=0; fi
+		: > "$f"
+	fi
 
-	printf '%s %s %s\n' "$dl" "$ul" "$(date +%s)" > "$PRIO_STATE/measure.txt" 2>/dev/null
+	printf '%s %s %s %s\n' "$dl" "$ul" "$(date +%s)" "$node" > "$PRIO_STATE/measure.txt" 2>/dev/null
 	# The round trip right after a full-speed measurement is not a fair sample
 	# (the modem is still draining), and judging it made the controller cut the
 	# rate the measurement had just established. Give it half a minute.
 	printf '%s\n' "$(date +%s)" > "$PRIO_STATE/last_measure" 2>/dev/null
 	rm -f "$PRIO_STATE/measuring" 2>/dev/null
-	printf 'down=%skbit up=%skbit\n' "$dl" "$ul"
+	printf 'down=%skbit up=%skbit via=%s node=%s\n' "$dl" "$ul" "$method" "$node"
 
 	# A measurement below 1 Mbit means the measurement failed (no route, the
 	# URL moved, the line was busy), not that the line is that slow. Keep the
 	# previous numbers rather than pinning the shaper to a bogus value.
-	# A failed half keeps its old number for display, but it must never be fed
-	# back into the shaper: that would be "raising the rate without evidence",
-	# and it also refreshed measured_at, so the age checks believed a fresh
-	# measurement had happened.
+	# A single sample sets the cap for every device, so a number far below what
+	# the line did recently is not trusted: a mirror throttling this IP, a busy
+	# moment or a truncated transfer must not pin the shaper to a tenth of the
+	# line and leave no way back (nothing in the control loop raises the rate).
+	# A real collapse still comes down, because the latency loop cuts on its own.
+	prev_dl="$(state_get measured_dl)"
+	case "$prev_dl" in ''|*[!0-9]*) prev_dl=0 ;; esac
+	prev_at="$(state_get measured_at)"
+	case "$prev_at" in ''|*[!0-9]*) prev_at=0 ;; esac
+	if [ "$dl" -ge 1000 ] && [ "$prev_dl" -ge 5000 ] &&
+	   [ $(( $(date +%s) - prev_at )) -lt 86400 ] &&
+	   [ "$dl" -lt $(( prev_dl * 50 / 100 )) ]; then
+		printf '%s\n' "$(date +%s)" > "$PRIO_STATE/measure_reject" 2>/dev/null
+		logger -t luci-app-prio "measurement ${dl}kbit is under half of ${prev_dl}kbit, ignored"
+		dl=$prev_dl
+	fi
 	dlok=0; ulok=0
 	[ "$dl" -ge 1000 ] && dlok=1
 	[ "$ul" -ge 1000 ] && ulok=1
@@ -1567,7 +1618,10 @@ measure() {
 	}
 	state_set measured_dl "$dl"
 	state_set measured_ul "$ul"
-	state_set measured_at "$(date +%s)"
+	# The timestamp describes the DOWNLOAD number (that is what the shaper uses
+	# and what the freshness checks read), so a failed download must not renew
+	# it -- otherwise an old value looks fresh forever.
+	[ "$dlok" = 1 ] && state_set measured_at "$(date +%s)"
 	# A measurement that finished after the engine was stopped must not rebuild
 	# the queue it just tore down.
 	if [ "$(state_get enabled)" != "1" ]; then
@@ -1585,23 +1639,27 @@ measure() {
 		bands="$(state_get bands)"; case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
 		lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"; [ -n "$lan" ] || lan="$(state_get lan_iface)"
 		apply_downlink_rate "$lan" "$bands" "$dl"
-		# A pinned uplink rate wins over the measurement: the upload probe has
-		# to cross an international path in most setups, so it under-reports the
-		# line badly (measured 35 Mbit here while an unshaped client reached
-		# 80). Download does not have that problem -- the mirror used for it is
-		# local.
+		# A pinned uplink rate wins over the measurement.
 		local mup
 		mup="$(state_get uplink_kbit)"
 		case "$mup" in ''|*[!0-9]*) mup=0 ;; esac
 		if [ "$ulok" = 1 ] && [ "$ul" -ge 1000 ] && [ "$mup" -lt 1000 ] && [ "$(state_get uplink)" = "1" ]; then
-			state_set uplink_learned "$ul"
-			if apply_uplink_rate "$dev" "$ul"; then
-				set_up_rate "$ul"
+			# The uplink has no margin anywhere else in the chain, so it is
+			# applied here: shaping at the measured value itself puts the queue
+			# straight back into the modem.
+			local um ulshape
+			um="$(margin_pct)"
+			ulshape=$(( ul * (100 - um) / 100 ))
+			[ "$ulshape" -lt 2000 ] && ulshape=2000
+			[ "$ulshape" -gt 200000 ] && ulshape=200000
+			state_set uplink_learned "$ulshape"
+			if apply_uplink_rate "$dev" "$ulshape"; then
+				set_up_rate "$ulshape"
 			fi
 		fi
 	fi
 	release_lock
-	logger -t luci-app-prio "measured down ${dl}kbit up ${ul}kbit"
+	logger -t luci-app-prio "measured down ${dl}kbit up ${ul}kbit via ${method} ${node}"
 	return 0
 }
 

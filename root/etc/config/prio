@@ -36,7 +36,10 @@ config main 'main'
 	# (a mainland mirror for download, Cloudflare for upload).
 	option measure_url ''
 	option measure_up_url ''
-	option measure_secs '6'
+	option measure_secs '4'
+	# auto = use the cnspeedtest client this firmware ships (a mainland node,
+	# 8 parallel streams); http = the built-in fallback (a mirror + Cloudflare).
+	option measure_method 'auto'
 	option measure_interval '0'
 	option measured_dl ''
 	option measured_ul ''
