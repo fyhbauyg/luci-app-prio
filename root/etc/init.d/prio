@@ -34,7 +34,7 @@ START=99
 STOP=10
 # Without this, rc.common rejects `status` and prints its usage text, so every
 # caller (LuCI included) sees the service as dead even while it is running.
-EXTRA_COMMANDS="status reload apply calibrate pickprobe"
+EXTRA_COMMANDS="status reload apply calibrate pickprobe measure"
 EXTRA_HELP="	status	Show whether the priority engine is running
 	reload	Re-apply the configuration
 	apply <0|1>	Re-apply and wait until the committed switch matches <0|1>
@@ -233,7 +233,8 @@ mac_for_ip() {
 
 # Looks up the band a MAC was registered with. Empty when unknown.
 band_for_mac() {
-	awk -v mac="$1" '$1==mac {print $2; exit}' "$PRIO_STATE/macmap" 2>/dev/null
+	# "downband upband"; older maps only carry the first one
+	awk -v mac="$1" '$1==mac {print $2, ($3 == "" ? $2 : $3); exit}' "$PRIO_STATE/macmap" 2>/dev/null
 }
 
 # True when the address is already in the set for that band, so the periodic
@@ -253,6 +254,10 @@ prio_nft_device() {
 	[ "$enabled" = 1 ] || return 0
 	config_get ip "$section" ip
 	config_get band "$section" band 0
+	config_get band_up "$section" band_up
+	# No separate upload band means "same as download" -- that is the old
+	# behaviour and still the useful default.
+	[ -n "$band_up" ] || band_up="$band"
 	[ -n "$ip" ] || return 0
 	# A stale or mistyped band must never grant top priority. Non-numeric and
 	# out-of-range values both clamp DOWN to the lowest band.
@@ -266,6 +271,12 @@ prio_nft_device() {
 		echo "band:clamped:${ip}:${band}" >> "$PRIO_STATE/err"
 		band="$PRIO_BANDS_MAX"
 	fi
+	case "$band_up" in
+		''|*[!0-9]*) band_up="$band" ;;
+	esac
+	if [ "$band_up" -gt "$PRIO_BANDS_MAX" ] 2>/dev/null; then
+		band_up="$PRIO_BANDS_MAX"
+	fi
 
 	# dedupe: one IP must only live in one band
 	if grep -q "^${ip} " "$PRIO_STATE/ipmap" 2>/dev/null; then
@@ -274,14 +285,15 @@ prio_nft_device() {
 	fi
 
 	if nft add element "$NFT_TABLE" "s${band}" "{ $ip }" 2>>"$PRIO_STATE/err"; then
-		printf '%s %s\n' "$ip" "$band" >> "$PRIO_STATE/ipmap"
+		nft add element "$NFT_TABLE" "su${band_up}" "{ $ip }" 2>>"$PRIO_STATE/err"
+		printf '%s %s %s\n' "$ip" "$band" "$band_up" >> "$PRIO_STATE/ipmap"
 		# Remember the device identity for the IPv6 side. A failed lookup is
 		# not fatal: IPv4 keeps working and the refresh loop retries later.
 		local mac
 		mac="$(mac_for_ip "$ip")"
 		if [ -n "$mac" ]; then
 			if ! grep -q "^${mac} " "$PRIO_STATE/macmap" 2>/dev/null; then
-				printf '%s %s\n' "$mac" "$band" >> "$PRIO_STATE/macmap"
+				printf '%s %s %s\n' "$mac" "$band" "$band_up" >> "$PRIO_STATE/macmap"
 			fi
 		else
 			echo "mac:unknown:${ip}" >> "$PRIO_STATE/err"
@@ -305,7 +317,7 @@ refresh_addrs() {
 }
 
 refresh_family() {
-	local lan="$1" fam="$2" addr rest mac band set
+	local lan="$1" fam="$2" addr rest mac band bup set
 	local list="$PRIO_STATE/.neigh.$$"
 	if [ "$fam" = 6 ]; then
 		ip -6 neigh show dev "$lan" 2>/dev/null > "$list"
@@ -319,17 +331,19 @@ refresh_family() {
 		esac
 		mac="$(printf '%s\n' "$rest" | grep -o 'lladdr [0-9a-f:]*' | cut -d' ' -f2)"
 		[ -n "$mac" ] || continue
-		band="$(band_for_mac "$mac")"
+		band="$(band_for_mac "$mac" | cut -d' ' -f1)"
+		bup="$(band_for_mac "$mac" | cut -d' ' -f2)"
 		[ -n "$band" ] || continue
-		if [ "$fam" = 6 ]; then
-			set="s6_${band}"
-		else
-			set="s${band}"
-		fi
-		addr_known "$set" "$addr" && continue
-		if nft add element "$NFT_TABLE" "$set" "{ $addr }" 2>/dev/null; then
-			addr_remember "$set" "$addr"
-		fi
+		[ -n "$bup" ] || bup="$band"
+		for set in \
+			"$([ "$fam" = 6 ] && echo "s6_${band}" || echo "s${band}")" \
+			"$([ "$fam" = 6 ] && echo "s6u_${bup}" || echo "su${bup}")"; do
+			[ -n "$set" ] || continue
+			addr_known "$set" "$addr" && continue
+			if nft add element "$NFT_TABLE" "$set" "{ $addr }" 2>/dev/null; then
+				addr_remember "$set" "$addr"
+			fi
+		done
 	done < "$list"
 	: > "$list"
 }
@@ -352,6 +366,10 @@ setup_nft() {
 		# IPv6 mirrors of the same bands. Kept separate because a set has one
 		# address family; the band number and mark are shared.
 		nft add set $NFT_TABLE "s6_${b}" '{ type ipv6_addr; flags interval; }' 2>>"$PRIO_STATE/err"
+		# Upload can be graded differently from download, so it needs its own
+		# sets: same device, possibly a different band.
+		nft add set $NFT_TABLE "su${b}" '{ type ipv4_addr; flags interval; }' 2>>"$PRIO_STATE/err"
+		nft add set $NFT_TABLE "s6u_${b}" '{ type ipv6_addr; flags interval; }' 2>>"$PRIO_STATE/err"
 	done
 
 	config_foreach prio_nft_device device
@@ -382,11 +400,11 @@ setup_nft() {
 	for b in 0 1 2 3 4 5 6 7; do
 		local mark
 		mark="$(band_mark "$b")"
-		if nft add rule $NFT_TABLE upmark oifname "$wan" ip saddr "@s${b}" \
+		if nft add rule $NFT_TABLE upmark oifname "$wan" ip saddr "@su${b}" \
 			meta mark set meta mark and "$UNMARK_MASK" or "$mark" 2>>"$PRIO_STATE/err"; then
 			rules=$((rules + 1))
 		fi
-		if nft add rule $NFT_TABLE upmark oifname "$wan" ip6 saddr "@s6_${b}" \
+		if nft add rule $NFT_TABLE upmark oifname "$wan" ip6 saddr "@s6u_${b}" \
 			meta mark set meta mark and "$UNMARK_MASK" or "$mark" 2>>"$PRIO_STATE/err"; then
 			rules=$((rules + 1))
 		fi
@@ -876,6 +894,11 @@ start_detect() {
 		next_probe=0
 		downmiss=0
 		upmiss=0
+		mint=$(state_get measure_interval)
+		case "$mint" in ''|*[!0-9]*) mint=0 ;; esac
+		[ "$mint" -gt 0 ] && [ "$mint" -lt 120 ] && mint=120
+		mnow=$(date +%s)
+		next_meas=$(( mnow + mint ))
 		link_max=0
 		spd="$(cat "/sys/class/net/$dev/speed" 2>/dev/null)"
 		case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
@@ -970,6 +993,30 @@ start_detect() {
 			thr=$(( win_bytes * 8 * 100 / win_cs / 1000 ))
 			thr_up=$(( win_txb * 8 * 100 / win_cs / 1000 ))
 			win_bytes=0; win_txb=0; win_cs=0
+			# A measurement of our own was running through this window. Its
+			# bytes are not line throughput, and treating them as such would
+			# make the controller cut the rate the measurement is about to
+			# establish.
+			if [ -f "$PRIO_STATE/measuring" ]; then
+				thr=0
+				thr_up=0
+				continue
+			fi
+			lm=$(cat "$PRIO_STATE/last_measure" 2>/dev/null)
+			case "$lm" in ''|*[!0-9]*) lm=0 ;; esac
+			if [ "$lm" -gt 0 ] && [ $(( $(date +%s) - lm )) -lt 30 ]; then
+				continue
+			fi
+			# Periodic re-measurement: capacity comes from here, never from
+			# latency. Only when the line is quiet, so nobody notices.
+			if [ "$mint" -ge 120 ]; then
+				mnow=$(date +%s)
+				if [ "$mnow" -ge "$next_meas" ] && [ "$thr" -lt 2 ] && [ "$thr_up" -eq 0 ]; then
+					next_meas=$(( mnow + mint ))
+					logger -t luci-app-prio "periodic measurement"
+					( /etc/init.d/prio measure ) </dev/null >/dev/null 2>&1 &
+				fi
+			fi
 			now=$(now_cs)
 
 			over=$(htb_overlimits "$lan")
@@ -1121,12 +1168,6 @@ start_detect() {
 					# somewhere, hold in between. Cuts are never gated on
 					# anything, so a capacity drop always comes back down.
 					newup=$up
-					ubind=0
-					if [ $(( thr_up * 100 )) -ge $(( up * 80 )) ]; then
-						ubind=1
-					fi
-					ug=$(cat "$PRIO_STATE/up_good" 2>/dev/null)
-					case "$ug" in ''|*[!0-9]*) ug=0 ;; esac
 					if [ "$urtt" -eq 0 ]; then
 						newup=$(( up * 85 / 100 ))
 					elif { [ "$base" -gt 0 ] && [ "$urtt" -gt $(( base + 300 )) ]; } ||
@@ -1138,19 +1179,8 @@ start_detect() {
 						[ "$ustep" -gt 30 ] && ustep=30
 						[ "$ustep" -lt 10 ] && ustep=10
 						newup=$(( up * (100 - ustep) / 100 ))
-						[ "$ug" -gt "$up" ] && printf '%s\n' "$up" > "$PRIO_STATE/up_good"
-					elif [ "$ubind" = 1 ] && [ "$base" -gt 0 ] && [ "$urtt" -le $(( base + 150 )) ]; then
-						if [ "$up" -gt "$ug" ]; then
-							ug=$up
-							printf '%s\n' "$ug" > "$PRIO_STATE/up_good"
-						fi
-						if [ "$ug" -gt "$up" ]; then
-							newup=$(( up * 120 / 100 ))
-							[ "$newup" -gt "$ug" ] && newup=$ug
-						else
-							newup=$(( up * 112 / 100 ))
-						fi
-						[ "$newup" -gt 200000 ] && newup=200000
+						# no automatic raise here either: measure() seeds the
+						# uplink, latency only cuts it
 					fi
 					[ "$newup" -lt 2000 ] && newup=2000
 					if [ "$newup" -ne "$up" ]; then
@@ -1230,12 +1260,23 @@ start_detect() {
 			# A "binding" test was tried and rejected: with the real capacity
 			# below the applied rate the measured throughput can never reach
 			# 80% of it, so the gate stayed closed and the rate never came down.
-			rg=$(cat "$PRIO_STATE/rate_good" 2>/dev/null)
-			case "$rg" in ''|*[!0-9]*) rg=0 ;; esac
 			if [ "$rtt" -eq 0 ]; then
 				newrate=$(( rate * 80 / 100 ))
 			elif { [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 300 )) ]; } ||
 			     { [ "$base" -eq 0 ] && [ "$rtt" -gt 200 ]; }; then
+				# If the estimate has fallen far below what the line last
+				# measured, this is not a transient queue any more: schedule a
+				# fresh measurement (rate limited to once per 10 minutes).
+				mref=$(state_get measured_dl)
+				case "$mref" in ''|*[!0-9]*) mref=0 ;; esac
+				if [ "$mref" -ge 1000 ] && [ "$rate" -lt $(( mref * 70 / 100 )) ]; then
+					lmr=$(cat "$PRIO_STATE/last_measure" 2>/dev/null)
+					case "$lmr" in ''|*[!0-9]*) lmr=0 ;; esac
+					if [ $(( $(date +%s) - lmr )) -gt 600 ] && [ ! -f "$PRIO_STATE/measuring" ]; then
+						( sleep 5; /etc/init.d/prio measure ) </dev/null >/dev/null 2>&1 &
+						logger -t luci-app-prio "rate fell well below the last measurement, re-measuring"
+					fi
+				fi
 				# Cut in proportion to how far the queue sits beyond the
 				# baseline: -10% for a small overshoot, -30% for a blown-up one.
 				# The previous ratio was a constant -30% for every base below
@@ -1247,22 +1288,11 @@ start_detect() {
 				[ "$step" -gt 30 ] && step=30
 				[ "$step" -lt 10 ] && step=10
 				newrate=$(( rate * (100 - step) / 100 ))
-				# The rate that just failed is the ceiling for the memory: it
-				# used to be decayed to 1.5x of the PRE-cut rate, which stopped
-				# falling after the first cut and left a stale high value.
-				[ "$rg" -gt "$rate" ] && printf '%s\n' "$rate" > "$PRIO_STATE/rate_good"
-			elif [ "$bind" = 1 ] && [ "$base" -gt 0 ] && [ "$rtt" -le $(( base + 150 )) ]; then
-				if [ "$rate" -gt "$rg" ]; then
-					rg=$rate
-					printf '%s\n' "$rg" > "$PRIO_STATE/rate_good"
-				fi
-				if [ "$rg" -gt "$rate" ]; then
-					# below a rate this shaper already proved: climb at 20%
-					newrate=$(( rate * 120 / 100 ))
-					[ "$newrate" -gt "$rg" ] && newrate=$rg
-				else
-					newrate=$(( rate * 112 / 100 ))
-				fi
+				# Nothing here ever raises the rate. Capacity comes from
+				# measure(); this loop only takes capacity away when the
+				# queue shows up. That is the whole point of r71: a raise
+				# needs evidence, and latency is not evidence of capacity --
+				# three audits found a different way for it to run away.
 			fi
 			[ "$newrate" -gt "$ceiling" ] && newrate=$ceiling
 			[ "$newrate" -lt 2000 ] && newrate=2000
@@ -1383,6 +1413,134 @@ EOF
 	state_set rtt_target "$best"
 	logger -t luci-app-prio "probe target -> $best (${bestrtt}ms)"
 	echo "$best"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# measure: find the line's capacity by actually using it.
+#
+# The one thing the latency loop can never learn is how much the line can carry:
+# latency says "there is a queue", never "these bits fit". So capacity comes
+# from a measurement -- the router downloads and uploads through its own
+# unshaped class (traffic this router originates is unmarked, so it lands in
+# 1:1 at 10 Gbit and never touches the shaped class) and counts the bytes on
+# the WAN interface while it runs. Latency keeps its own job: taking capacity
+# away when the queue appears.
+# ---------------------------------------------------------------------------
+measure() {
+	local dev dl_url ul_url secs a b dl ul f pid rc
+	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
+	[ -n "$dev" ] || dev="$(state_get wan_iface)"
+	[ -n "$dev" ] || dev=eth2
+	dl_url="$(state_get measure_url)"
+	[ -n "$dl_url" ] || dl_url="https://mirrors.ustc.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.3-live-server-amd64.iso"
+	ul_url="$(state_get measure_up_url)"
+	[ -n "$ul_url" ] || ul_url="https://speed.cloudflare.com/__up"
+	secs="$(state_get measure_secs)"
+	case "$secs" in ''|*[!0-9]*) secs=6 ;; esac
+	[ "$secs" -lt 2 ] && secs=2
+	[ "$secs" -gt 15 ] && secs=15
+
+	command -v curl >/dev/null 2>&1 || { echo "measure:no-curl"; return 1; }
+	[ -e "/sys/class/net/$dev/statistics/rx_bytes" ] || { echo "measure:no-iface"; return 1; }
+
+	# Tell the detector to throw away the window it is currently collecting:
+	# this traffic is ours, and counting it as line throughput would make the
+	# controller cut the very rate we are trying to establish.
+	: > "$PRIO_STATE/measuring"
+
+	# --- download ---
+	# Start the transfer first and only then start counting: the first second
+	# is TCP slow start, and timing it as if it were the line made a 185 Mbit
+	# link measure as 65 Mbit.
+	local p1 p2 p3 p4
+	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p1=$!
+	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p2=$!
+	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p3=$!
+	curl -s -o /dev/null --max-time $((secs + 10)) "$dl_url" 2>/dev/null & p4=$!
+	sleep 3
+	a=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+	case "$a" in ''|*[!0-9]*) a=0 ;; esac
+	sleep "$secs"
+	kill "$p1" "$p2" "$p3" "$p4" 2>/dev/null
+	wait 2>/dev/null
+	b=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+	case "$b" in ''|*[!0-9]*) b=0 ;; esac
+	if [ "$b" -gt "$a" ]; then dl=$(( (b - a) * 8 / 1000 / secs )); else dl=0; fi
+
+	# --- upload ---
+	f=/tmp/.prio-measure-up
+	dd if=/dev/zero of="$f" bs=1048576 count=12 2>/dev/null
+	curl -s -o /dev/null --max-time $((secs + 10)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p1=$!
+	curl -s -o /dev/null --max-time $((secs + 10)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p2=$!
+	curl -s -o /dev/null --max-time $((secs + 10)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p3=$!
+	sleep 3
+	a=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+	case "$a" in ''|*[!0-9]*) a=0 ;; esac
+	sleep "$secs"
+	kill "$p1" "$p2" "$p3" 2>/dev/null
+	wait 2>/dev/null
+	b=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+	case "$b" in ''|*[!0-9]*) b=0 ;; esac
+	if [ "$b" -gt "$a" ]; then ul=$(( (b - a) * 8 / 1000 / secs )); else ul=0; fi
+	: > "$f"
+
+	printf '%s %s %s\n' "$dl" "$ul" "$(date +%s)" > "$PRIO_STATE/measure.txt" 2>/dev/null
+	# The round trip right after a full-speed measurement is not a fair sample
+	# (the modem is still draining), and judging it made the controller cut the
+	# rate the measurement had just established. Give it half a minute.
+	printf '%s\n' "$(date +%s)" > "$PRIO_STATE/last_measure" 2>/dev/null
+	rm -f "$PRIO_STATE/measuring" 2>/dev/null
+	printf 'down=%skbit up=%skbit\n' "$dl" "$ul"
+
+	# A measurement below 1 Mbit means the measurement failed (no route, the
+	# URL moved, the line was busy), not that the line is that slow. Keep the
+	# previous numbers rather than pinning the shaper to a bogus value.
+	if [ "$dl" -lt 1000 ] && [ "$ul" -lt 1000 ]; then
+		logger -t luci-app-prio "measurement failed (down ${dl} up ${ul} kbit)"
+		return 1
+	fi
+	[ "$dl" -ge 1000 ] || dl="$(state_get measured_dl)"
+	[ "$ul" -ge 1000 ] || ul="$(state_get measured_ul)"
+
+	acquire_lock || {
+		# store the numbers even without the lock; the next start() will use them
+		state_set measured_dl "$dl"
+		state_set measured_ul "$ul"
+		state_set measured_at "$(date +%s)"
+		return 0
+	}
+	state_set measured_dl "$dl"
+	state_set measured_ul "$ul"
+	state_set measured_at "$(date +%s)"
+	if [ "$(state_get auto_bandwidth)" = "1" ]; then
+		# In automatic mode the measurement is the estimate. shaper_margin is
+		# applied on top of it when the rate is handed to tc, so the shaped
+		# value ends up at (100 - margin)% of what the line just delivered.
+		state_set shaper_learned "$dl"
+		printf '%s\n' "$dl" > "$PRIO_STATE/shaper" 2>/dev/null
+		printf '%s\n' "$dl" > "$PRIO_STATE/peak" 2>/dev/null
+		local bands lan
+		bands="$(state_get bands)"; case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
+		lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"; [ -n "$lan" ] || lan="$(state_get lan_iface)"
+		apply_downlink_rate "$lan" "$bands" "$dl"
+		# A pinned uplink rate wins over the measurement: the upload probe has
+		# to cross an international path in most setups, so it under-reports the
+		# line badly (measured 35 Mbit here while an unshaped client reached
+		# 80). Download does not have that problem -- the mirror used for it is
+		# local.
+		local mup
+		mup="$(state_get uplink_kbit)"
+		case "$mup" in ''|*[!0-9]*) mup=0 ;; esac
+		if [ "$ul" -ge 1000 ] && [ "$mup" -lt 1000 ] && [ "$(state_get uplink)" = "1" ]; then
+			state_set uplink_learned "$ul"
+			if apply_uplink_rate "$dev" "$ul"; then
+				set_up_rate "$ul"
+			fi
+		fi
+	fi
+	release_lock
+	logger -t luci-app-prio "measured down ${dl}kbit up ${ul}kbit"
 	return 0
 }
 
@@ -1683,11 +1841,6 @@ start() {
 		state_set uplink_learned ""
 		: > "$PRIO_STATE/up_rate"
 		: > "$PRIO_STATE/uptx"
-		# The "last rate that worked" memories belong to the old link, and so
-		# does the loaded-latency floor: a floor learned on the old path would
-		# make the new one look permanently congested.
-		: > "$PRIO_STATE/rate_good"
-		: > "$PRIO_STATE/up_good"
 	fi
 
 	# The uplink and downlink hooks must be on different interfaces.
@@ -1748,6 +1901,36 @@ start() {
 		# the last rate it had
 		: > "$PRIO_STATE/upshaper" 2>/dev/null
 		qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
+	fi
+
+	# Capacity comes from a measurement, not from a guess: seed the estimate
+	# from the last one, and if it is missing or stale run a fresh one in the
+	# background (it takes about ten seconds and does not block the start).
+	if [ "$auto_bw" = 1 ]; then
+		local md mid mi
+		md="$(state_get measured_dl)"
+		case "$md" in ''|*[!0-9]*) md=0 ;; esac
+		mi="$(state_get measure_interval)"
+		case "$mi" in ''|*[!0-9]*) mi=0 ;; esac
+		# 0 = no periodic measurement: a capacity probe costs real traffic
+		# (over 100 MB on a fast line), which is not something to spend on a
+		# mobile plan every hour. 0 still measures on start, when the latency
+		# loop has cut the rate well below the last measurement, and when the
+		# button is pressed.
+		[ "$mi" -gt 0 ] && [ "$mi" -lt 120 ] && mi=120
+		if [ "$md" -ge 1000 ] && [ ! -s "$PRIO_STATE/shaper" ]; then
+			printf '%s\n' "$md" > "$PRIO_STATE/shaper"
+			printf '%s\n' "$md" > "$PRIO_STATE/peak"
+		fi
+		local at now stale
+		at="$(state_get measured_at)"
+		case "$at" in ''|*[!0-9]*) at=0 ;; esac
+		now=$(date +%s)
+		stale=$(( now - at ))
+		if [ "$md" -lt 1000 ] || { [ "$mi" -ge 120 ] && [ "$stale" -ge "$mi" ]; }; then
+			( sleep 15; /etc/init.d/prio measure ) </dev/null >/dev/null 2>&1 &
+			logger -t luci-app-prio "measurement scheduled (age ${stale}s)"
+		fi
 	fi
 
 	# 4. downlink

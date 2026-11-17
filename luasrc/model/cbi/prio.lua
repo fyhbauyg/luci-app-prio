@@ -327,16 +327,47 @@ o.rmempty = false
 o.description = translate("Hardware HNAT bypasses the qdisc and would make priority useless. " ..
 	"Software flow offloading keeps packets on the qdisc path.")
 
-o = s:option(Flag, "auto_bandwidth", translate("Auto-learn downlink bandwidth (experimental)"))
-o.default = 0
+o = s:option(Flag, "auto_bandwidth", translate("Measure the line automatically"))
+o.default = 1
 o.rmempty = false
-o.description = translate("While there is traffic the shaper watches the round trip to " ..
-	"the probe target: near the idle baseline it raises the limit a little, blown up it " ..
-	"lowers it. That keeps the queue on this router, which is what priority needs. " ..
-	"It needs a probe target that answers ping and an idle window for the baseline, " ..
-	"and it cannot tell our own queue from the modem's, so it only ever finds the " ..
-	"line's capacity approximately. Measured fixed rates are steadier: run a " ..
-	"speedtest and enter about 85% of what it reports.")
+o.description = translate("Capacity is measured, not guessed: the router downloads and " ..
+	"uploads through its own unshaped path for a few seconds (on start and every " ..
+	"half hour), and the shaper runs at that value minus the safety margin. The " ..
+	"latency loop may only LOWER the rate afterwards, never raise it, because a " ..
+	"round trip tells you that there is a queue but never how many bits fit.")
+
+o = s:option(DummyValue, "_measured", translate("Measured capacity"))
+o.cfgvalue = function()
+	local function num(v) return tonumber(v or "") or 0 end
+	local ok1, dl = pcall(function() return uci:get("prio", "main", "measured_dl") end)
+	local ok2, ul = pcall(function() return uci:get("prio", "main", "measured_ul") end)
+	local ok3, at = pcall(function() return uci:get("prio", "main", "measured_at") end)
+	dl, ul = num(ok1 and dl), num(ok2 and ul)
+	if dl < 1 and ul < 1 then
+		return translate("not measured yet")
+	end
+	local age = ""
+	local t0 = tonumber(ok3 and at or "") or 0
+	if t0 > 0 then
+		local d = os.time() - t0
+		if d >= 0 then
+			if d < 120 then age = translate("just now")
+			elseif d < 7200 then age = string.format(translate("%d minutes ago"), math.floor(d / 60))
+			else age = string.format(translate("%d hours ago"), math.floor(d / 3600)) end
+		end
+	end
+	return string.format("%.1f Mbit/s ↓  ·  %.1f Mbit/s ↑  ·  %s", dl / 1000, ul / 1000, age)
+end
+
+o = s:option(Button, "_measure", translate("Measured capacity"))
+o.inputtitle = translate("Measure now (takes about 10 seconds)")
+o.inputstyle = "reload"
+o.description = translate("Downloads and uploads for a few seconds through the router " ..
+	"itself and records what the line actually delivered.")
+o.write = function()
+	require("luci.sys").call("/etc/init.d/prio measure >/dev/null 2>&1")
+	require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")
+end
 
 o = s:option(Value, "rtt_target", translate("Latency probe target"))
 o.default = "223.5.5.5"
@@ -672,7 +703,7 @@ local known = ip_index()
 d = m:section(TypedSection, "device", translate("Device Priority List"))
 d.anonymous = true
 d.addremove = true
-d.sortable = true
+d.sortable = false
 d.template = "cbi/tblsection"
 
 o = d:option(Flag, "enabled", translate("Enable"))
@@ -694,13 +725,25 @@ for _, t in ipairs(read_leases()) do
 	end
 end
 
-o = d:option(ListValue, "band", translate("Priority Band"))
+o = d:option(ListValue, "band", translate("Priority Band (download)"))
 for i = 0, bands - 1 do
 	o:value(tostring(i), translatef("Band %d", i))
 end
 o.default = 0
 o.rmempty = false
-o.width = "24%"
+o.width = "20%"
+
+-- Upload is graded separately: the marks for the two directions are applied in
+-- different chains (download by destination, upload by source), so a device can
+-- be top priority on the way out and bottom on the way in.
+o = d:option(ListValue, "band_up", translate("Priority Band (upload)"))
+for i = 0, bands - 1 do
+	o:value(tostring(i), translatef("Band %d", i))
+end
+o.default = ""
+o.rmempty = true
+o.width = "20%"
+o.description = translate("Empty means the same band as download.")
 
 -- ============================================================
 -- 保存后立即应用（修 P0-2）
@@ -737,7 +780,9 @@ o.title = translate("How it works")
 o.cfgvalue = function()
 	return translate("Band 0 is strictly prioritised; the other bands share bandwidth via DRR. " ..
 		"Traffic is marked before NAT, so the classification applies to forwarded traffic. " ..
-		"A shaper on the downlink path keeps a queue so the scheduler has something to reorder.")
+		"A shaper on the downlink path keeps a queue so the scheduler has something to reorder. " ..
+		"Download and upload are two separate queues: download is matched by the destination " ..
+		"address, upload by the source, so the two band columns are independent.")
 end
 
 return m

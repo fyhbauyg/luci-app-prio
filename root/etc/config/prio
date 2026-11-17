@@ -2,10 +2,10 @@
 config main 'main'
 	option enabled '0'
 	option auto_hnat_off '1'
-	# 0 = use shaper_kbit / uplink_kbit as they are. 1 = let the latency loop
-	# adjust the downlink rate. The loop is still experimental: measure the
-	# line once and type the number in if you want predictable behaviour.
-	option auto_bandwidth '0'
+	# 1 = capacity comes from a real measurement (about 10 s on start, then
+	# every measure_interval seconds) and the latency loop may only LOWER the
+	# rate. 0 = use shaper_kbit / uplink_kbit exactly as configured.
+	option auto_bandwidth '1'
 	option bands '3'
 	option strict_bands '1'
 	option fq_codel '1'
@@ -27,4 +27,13 @@ config main 'main'
 	# at what the line delivered and the latency loop trims it. A number of
 	# 1000 or more pins the rate instead and the loop leaves it alone.
 	option uplink_kbit '0'
+	# Capacity measurement. Empty URLs fall back to the built-in defaults
+	# (a mainland mirror for download, Cloudflare for upload).
+	option measure_url ''
+	option measure_up_url ''
+	option measure_secs '6'
+	option measure_interval '0'
+	option measured_dl ''
+	option measured_ul ''
+	option measured_at ''
 	option uplink_learned ''
