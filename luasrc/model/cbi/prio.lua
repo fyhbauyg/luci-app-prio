@@ -351,6 +351,19 @@ o.description = translate("Used by the calibration below to measure how much lat
 	"rate costs. Pick a stable public address near you; an unreachable one makes the " ..
 	"calibration table useless.")
 
+-- The picker shells out to traceroute, which is no longer a hard dependency
+-- (the package name did not exist in the firmware feed and made apk refuse the
+-- install). Show the button only when the binary is really there, instead of
+-- offering one that silently does nothing.
+local has_traceroute = false
+do
+	for _, p in ipairs({ "/usr/bin/traceroute", "/bin/traceroute",
+	                     "/usr/sbin/traceroute", "/sbin/traceroute" }) do
+		if fs.access(p) then has_traceroute = true break end
+	end
+end
+
+if has_traceroute then
 o = s:option(Button, "_pick_probe", translate("Latency probe target"))
 o.inputtitle = translate("Pick the closest hop automatically")
 o.inputstyle = "reload"
@@ -359,6 +372,13 @@ o.description = translate("Runs one traceroute and uses the nearest hop that als
 	"queue instead of the far end of the internet.")
 o.write = function()
 	require("luci.sys").call("/etc/init.d/prio pickprobe >/dev/null 2>&1")
+end
+else
+o = s:option(DummyValue, "_pick_probe_off", translate("Latency probe target"))
+o.cfgvalue = function()
+	return translate("automatic pick unavailable: traceroute is not installed")
+end
+o.description = translate("Install traceroute, or type the address of a nearby hop yourself.")
 end
 
 o = s:option(Value, "shaper_margin", translate("Safety margin (%)"))
@@ -492,6 +512,9 @@ o.write = function()
 	-- shaper_learned made this button a no-op (the next window read the same
 	-- peak straight back out of the config).
 	u:delete("prio", "main", "shaper_peak")
+	-- The uplink estimate is committed at every start() too; leaving it
+	-- behind makes "forget" restore the old number on the very next reload.
+	u:delete("prio", "main", "uplink_learned")
 	u:commit("prio")
 	local fh = io.open("/var/run/luci-app-prio/shaper", "w")
 	if fh then fh:write("0\n") fh:close() end
@@ -499,6 +522,10 @@ o.write = function()
 	-- it behind makes "forget the learned rate" a no-op.
 	os.remove("/var/run/luci-app-prio/rtt_base")
 	os.remove("/var/run/luci-app-prio/up_rate")
+	os.remove("/var/run/luci-app-prio/up_cfg")
+	-- otherwise the three samples collected before the button was pressed
+	-- seed the uplink again on the next window
+	os.remove("/var/run/luci-app-prio/uptx")
 	-- The detector keeps its live estimate in tmpfs and start() folds it back
 	-- into the config, so leaving this file makes "forget" a no-op.
 	os.remove("/var/run/luci-app-prio/peak")
@@ -514,6 +541,17 @@ o.rmempty = false
 o = s:option(Value, "uplink_kbit", translate("Uplink rate (kbit/s)"))
 o.datatype = "uinteger"
 o.placeholder = "0"
+-- 1..999 would be rounded down to "automatic" by the backend, so the number
+-- the user typed would look accepted and then quietly be ignored.
+o.validate = function(self, value)
+	if not value or value == "" then return value end
+	local n = tonumber(value)
+	if n and n > 0 and n < 1000 then
+		return nil, translate("Use 0 for automatic, or at least 1000 kbit/s: " ..
+			"smaller values mean \"automatic\" to the backend and would be ignored.")
+	end
+	return value
+end
 o.description = translate("0 means automatic: the upload stays open until it has seen " ..
 	"real upload traffic in three measuring windows (about a minute), then it starts " ..
 	"shaping at what the line actually delivered and the same latency controller trims " ..
@@ -532,6 +570,10 @@ o.cfgvalue = function()
 	end
 	if v == "auto" then
 		return translate("automatic -- measuring the upload first")
+	end
+	if v == "pending" then
+		return translate("not shaped -- automatic learning is off (turn on " ..
+			"automatic bandwidth or enter a rate)")
 	end
 	local n = v:match("^(%d+)")
 	n = n and tonumber(n) or 0

@@ -362,3 +362,15 @@ msgstr "尚未上报"
 
 msgid "automatic -- measuring the upload first"
 msgstr "自动 —— 正在先测上传能力"
+
+msgid "automatic pick unavailable: traceroute is not installed"
+msgstr "自动选取不可用：未安装 traceroute"
+
+msgid "Install traceroute, or type the address of a nearby hop yourself."
+msgstr "请安装 traceroute，或自己填写附近跳点的地址。"
+
+msgid "Use 0 for automatic, or at least 1000 kbit/s: smaller values mean \"automatic\" to the backend and would be ignored."
+msgstr "填 0 表示自动；填数字请至少 1000 kbit/s：小于 1000 的值会被后台当作自动，等于被忽略。"
+
+msgid "not shaped -- automatic learning is off (turn on automatic bandwidth or enter a rate)"
+msgstr "未整形 —— 自动学习已关闭（请开启自动带宽，或直接填写速率）"

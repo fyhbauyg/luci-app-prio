@@ -50,15 +50,79 @@ rate_kbit() {
 	}'
 }
 echo "      下行实际 $(rate_kbit $LAN) kbit，上行实际 $(rate_kbit $WAN) kbit"
-chk "下行速率 >= 2000 kbit" "[ $(rate_kbit $LAN) -ge 2000 ]"
-chk "状态文件里的 shaper 与实际一致 (±20%)" "[ \$(cat $ST/shaper 2>/dev/null || echo 0) -gt 0 ]"
+DOWNREAL=$(rate_kbit $LAN); case "$DOWNREAL" in ''|*[!0-9]*) DOWNREAL=0 ;; esac
+SHEST=$(cat $ST/shaper 2>/dev/null); case "$SHEST" in ''|*[!0-9]*) SHEST=0 ;; esac
+chk "下行速率 >= 2000 kbit" "[ $DOWNREAL -ge 2000 ]"
+if [ "$SHEST" -ge 2000 ] && [ "$DOWNREAL" -ge 2000 ]; then
+	PCT=$(( DOWNREAL * 100 / SHEST ))
+	if [ "$PCT" -ge 70 ] && [ "$PCT" -le 105 ]; then
+		ok "下行实际速率与估计一致 (${DOWNREAL}/${SHEST} kbit = ${PCT}%)"
+	else
+		no "下行实际速率与估计不符 (${DOWNREAL}/${SHEST} kbit = ${PCT}%)"
+	fi
+else
+	no "下行速率或估计缺失 (实际 ${DOWNREAL} / 估计 ${SHEST} kbit)"
+fi
 
 # 5. 控制器产物（基线要等一个完整的空闲窗口，约 25 秒）
 echo "      等待一个空闲窗口以学习延迟基线..."
 sleep 25
 chk "延迟基线已学到 (rtt_base)" "[ -s $ST/rtt_base ]"
-chk "上行速率文件存在" "test -f $ST/up_rate"
+# up_rate 由 start() 用 : > 创建，"文件存在"永远成立 —— 必须比内容与 tc
+chk "上行整形状态行已上报" "grep -q '^upshaper:' $ST/status"
+if [ -s $ST/up_rate ]; then
+	UR=$(cat $ST/up_rate); case "$UR" in ''|*[!0-9]*) UR=0 ;; esac
+	UPR=$(rate_kbit $WAN); case "$UPR" in ''|*[!0-9]*) UPR=0 ;; esac
+	if [ "$UR" -ge 2000 ] && [ "$UPR" -ge 2000 ] && [ "$(( UPR * 100 / UR ))" -ge 70 ]; then
+		ok "上行学到的速率已下发 (状态 ${UR} / 实际 ${UPR} kbit)"
+	else
+		no "上行速率与 tc 不符 (状态 ${UR} / 实际 ${UPR} kbit)"
+	fi
+else
+	sk "上行还在测量（up_rate 为空，属刚启动的正常状态）"
+fi
 chk "队列状态文件存在" "test -f $ST/queue"
+# 5b. 上行学习值持久化 / 手动值权威（审计 B1、B2）
+UPK0=$(uci -q get prio.main.uplink_kbit)
+UPL0=$(uci -q get prio.main.uplink_learned)
+uci -q set prio.main.uplink_learned=12345
+uci -q set prio.main.uplink_kbit=0
+uci -q commit prio
+rm -f $ST/up_rate $ST/up_cfg
+/etc/init.d/prio reload >/dev/null 2>&1; sleep 4
+PERS=$(rate_kbit $WAN); case "$PERS" in ''|*[!0-9]*) PERS=0 ;; esac
+if [ "$PERS" -ge 10000 ] && [ "$PERS" -le 15000 ]; then
+	ok "重启后上行沿用已学习的速率 (uplink_learned -> ${PERS} kbit)"
+else
+	no "上行学习值没有持久化 (期望 ~12345，实际 ${PERS} kbit)"
+fi
+chk "状态行在控制器改动后刷新为数值" "grep -qE '^upshaper:[0-9]+kbit' $ST/status"
+
+uci -q set prio.main.uplink_kbit=5000
+uci -q commit prio
+/etc/init.d/prio reload >/dev/null 2>&1; sleep 4
+MAN=$(rate_kbit $WAN); case "$MAN" in ''|*[!0-9]*) MAN=0 ;; esac
+if [ "$MAN" -ge 4000 ] && [ "$MAN" -le 6000 ]; then
+	ok "手动 uplink_kbit=5000 覆盖学习值 (实际 ${MAN} kbit)"
+else
+	no "手动值被学习值覆盖 (期望 ~5000，实际 ${MAN} kbit)"
+fi
+
+uci -q set prio.main.uplink_kbit=${UPK0:-0}
+if [ -n "$UPL0" ]; then
+	uci -q set prio.main.uplink_learned=$UPL0
+else
+	uci -q delete prio.main.uplink_learned
+fi
+uci -q commit prio
+/etc/init.d/prio reload >/dev/null 2>&1; sleep 3
+
+# 5c. 探针不可达保护与种子策略必须在两条路径上都存在（B3、B4）
+chk "上行也有 upmiss 保护" "grep -q 'upmiss=' /etc/init.d/prio"
+chk "上行种子拒绝已堆积的窗口" "grep -q 'sclean' /etc/init.d/prio"
+chk "上行种子取中间值而非最大值" "grep -q 'sed -n 2p' /etc/init.d/prio"
+chk "上行状态行由 apply_uplink_rate 刷新" "grep -q 'upshaper:\${rate}kbit' /etc/init.d/prio"
+
 
 # 6. 分类规则
 chk "nft 有 prio 链" "nft list ruleset | grep -qi 'prio'"

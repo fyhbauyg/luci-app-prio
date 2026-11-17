@@ -438,18 +438,51 @@ setup_filters() {
 }
 
 # ---------------- uplink: ETS at eth2 root ----------------
-# Rate for the shaped uplink class. The detector keeps its live value in
-# tmpfs; the config value only seeds it. 0 = do not shape the uplink at all.
+# Rate for the shaped uplink class.
+#   uplink_kbit >= 1000  the number the user typed. It is the seed the
+#                        controller works from, and a learned value that
+#                        outranks a deliberate low setting is exactly the
+#                        failure this feature exists to prevent -- so the live
+#                        value only counts while it was learned under the same
+#                        config value (up_cfg).
+#   uplink_kbit == 0     automatic: the live value in tmpfs, else the copy
+#                        committed by the last start() (uplink_learned)
+#   nothing              unshaped (setup_uplink builds the tree open at 1 Gbit)
 up_rate_kbit() {
-	local r
+	local r m c
+	m="$(state_get uplink_kbit)"
+	case "$m" in ''|*[!0-9]*) m=0 ;; esac
 	r="$(cat "$PRIO_STATE/up_rate" 2>/dev/null)"
 	case "$r" in ''|*[!0-9]*) r="" ;; esac
-	if [ -z "$r" ]; then
-		r="$(state_get uplink_kbit)"
-		case "$r" in ''|*[!0-9]*) r=0 ;; esac
+	if [ -n "$r" ]; then
+		c="$(cat "$PRIO_STATE/up_cfg" 2>/dev/null)"
+		case "$c" in ''|*[!0-9]*) c=0 ;; esac
+		if [ "$m" -lt 1000 ] || [ "$c" = "$m" ]; then
+			echo "$r"
+			return
+		fi
 	fi
+	if [ "$m" -ge 1000 ]; then
+		echo "$m"
+		return
+	fi
+	# /var/run is a tmpfs: after a reboot, or a save that did not carry the
+	# live value, fall back to the committed copy instead of restarting at
+	# "open" and re-learning from scratch.
+	r="$(state_get uplink_learned)"
+	case "$r" in ''|*[!0-9]*) r=0 ;; esac
 	[ "$r" -lt 1000 ] 2>/dev/null && r=0
 	echo "$r"
+}
+
+# Write the live uplink rate, remembering which uplink_kbit it was learned
+# under so a later manual change cannot be shadowed by it.
+set_up_rate() {
+	local c
+	printf '%s\n' "$1" > "$PRIO_STATE/up_rate" 2>/dev/null
+	c="$(state_get uplink_kbit)"
+	case "$c" in ''|*[!0-9]*) c=0 ;; esac
+	printf '%s\n' "$c" > "$PRIO_STATE/up_cfg" 2>/dev/null
 }
 
 apply_uplink_rate() {
@@ -459,7 +492,17 @@ apply_uplink_rate() {
 	[ "$burst" -gt 128000 ] && burst=128000
 	tc class change dev "$dev" parent 1: classid 1:100 \
 		htb rate "${rate}kbit" ceil "${rate}kbit" \
-		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"
+		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err" || return 1
+	# setup_uplink writes the upslaper line once, at start(); the controller
+	# changes the rate afterwards and used to leave the page showing "still
+	# measuring" forever. Rewrite the line, dropping the previous one first so
+	# repeated windows do not accumulate.
+	if [ -f "$PRIO_STATE/status" ]; then
+		grep -vE '^upshaper:' "$PRIO_STATE/status" > "$PRIO_STATE/status.tmp" 2>/dev/null
+		mv "$PRIO_STATE/status.tmp" "$PRIO_STATE/status" 2>/dev/null
+	fi
+	echo "upshaper:${rate}kbit" >> "$PRIO_STATE/status"
+	return 0
 }
 
 # ---------------- uplink: optional HTB + ETS at eth2 root ----------------
@@ -514,7 +557,14 @@ setup_uplink() {
 	setup_filters "$dev" "$bands" 2
 	echo "uplink:ok" >> "$PRIO_STATE/status"
 	if [ "$upauto" = 1 ]; then
-		echo "upshaper:auto" >> "$PRIO_STATE/status"
+		# "auto" means the detector is going to measure the upload. When the
+		# learner is off (auto_bandwidth=0 or downlink disabled) nothing will
+		# ever do that, so say so instead of claiming it is measuring.
+		if [ "$(state_get auto_bandwidth)" = "1" ] && [ "$(state_get downlink)" = "1" ]; then
+			echo "upshaper:auto" >> "$PRIO_STATE/status"
+		else
+			echo "upshaper:pending" >> "$PRIO_STATE/status"
+		fi
 	else
 		echo "upshaper:${applied}kbit" >> "$PRIO_STATE/status"
 	fi
@@ -791,6 +841,7 @@ start_detect() {
 		probe_gap=300
 		next_probe=0
 		downmiss=0
+		upmiss=0
 		link_max=0
 		spd="$(cat "/sys/class/net/$dev/speed" 2>/dev/null)"
 		case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
@@ -951,50 +1002,93 @@ start_detect() {
 			# download) never reached it: the controller that exists to stop an
 			# upload from wrecking the latency was the one thing not running.
 			up=$(up_rate_kbit)
-			# Auto mode: no number anywhere, so learn one. While the uplink is
-			# still open the observed throughput IS a lower bound of what the
-			# line can upload, which is exactly the seed the loop needs.
+			# Auto mode: no number anywhere, so learn one -- but only from a
+			# window that proves the modem was NOT queueing. tx_bytes counts
+			# what the kernel handed to the modem driver, and a 4G modem takes
+			# packets and drops them instead of pushing back, so during a burst
+			# this reads far above what the RF link can carry: it measures
+			# supply, not delivery. A window whose own round trip is already
+			# blown up is exactly that case -- the queue sits in the modem and
+			# the number is meaningless. Discard it and wait for a clean one.
 			if [ "$up" -lt 1000 ] && [ "$thr_up" -gt 3000 ]; then
-				printf '%s\n' "$thr_up" >> "$PRIO_STATE/uptx"
-				tail -n 3 "$PRIO_STATE/uptx" > "$PRIO_STATE/uptx.tmp" 2>/dev/null &&
-					mv "$PRIO_STATE/uptx.tmp" "$PRIO_STATE/uptx" 2>/dev/null
-				useed=$(sort -n "$PRIO_STATE/uptx" 2>/dev/null | tail -n1)
-				case "$useed" in ''|*[!0-9]*) useed=0 ;; esac
-				nup=$(wc -l < "$PRIO_STATE/uptx" 2>/dev/null)
-				case "$nup" in ''|*[!0-9]*) nup=0 ;; esac
-				if [ "$nup" -ge 3 ] && [ "$useed" -ge 5000 ]; then
-					# start at what the line actually did, then let the
-					# latency loop trim it down to the knee
-					if apply_uplink_rate "$dev" "$useed"; then
-						printf '%s\n' "$useed" > "$PRIO_STATE/up_rate"
-						up=$useed
-						logger -t luci-app-prio "uplink learned from traffic: ${useed}kbit"
+				srtt=$(rtt_avg_ms)
+				case "$srtt" in ''|*[!0-9]*) srtt=0 ;; esac
+				sbase=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
+				case "$sbase" in ''|*[!0-9]*) sbase=0 ;; esac
+				sclean=0
+				if [ "$srtt" -gt 0 ]; then
+					if [ "$sbase" -gt 0 ]; then
+						[ "$srtt" -le $(( sbase + 80 )) ] && sclean=1
+					elif [ "$srtt" -le 150 ]; then
+						# No baseline yet, so judge on the absolute value: a
+						# modem queue sits near one second, a healthy line far
+						# below this.
+						sclean=1
+					fi
+				fi
+				if [ "$sclean" = 1 ]; then
+					printf '%s\n' "$thr_up" >> "$PRIO_STATE/uptx"
+					tail -n 3 "$PRIO_STATE/uptx" > "$PRIO_STATE/uptx.tmp" 2>/dev/null &&
+						mv "$PRIO_STATE/uptx.tmp" "$PRIO_STATE/uptx" 2>/dev/null
+					# The middle of three windows, not the largest: one burst
+					# must never become the seed. Then the same safety margin
+					# the downlink uses, because a seed above the real capacity
+					# puts the queue straight back into the modem.
+					useed=$(sort -n "$PRIO_STATE/uptx" 2>/dev/null | sed -n 2p)
+					case "$useed" in ''|*[!0-9]*) useed=0 ;; esac
+					umarg=$(margin_pct)
+					[ "$useed" -ge 1000 ] && useed=$(( useed * (100 - umarg) / 100 ))
+					[ "$useed" -gt "$ceiling" ] && useed=$ceiling
+					nup=$(wc -l < "$PRIO_STATE/uptx" 2>/dev/null)
+					case "$nup" in ''|*[!0-9]*) nup=0 ;; esac
+					if [ "$nup" -ge 3 ] && [ "$useed" -ge 5000 ]; then
+						if apply_uplink_rate "$dev" "$useed"; then
+							set_up_rate "$useed"
+							up=$useed
+							logger -t luci-app-prio "uplink seeded at ${useed}kbit (rtt ${srtt}ms, idle ${sbase}ms)"
+						fi
 					fi
 				fi
 			fi
 			if [ "$up" -ge 1000 ] && [ "$thr_up" -gt 1500 ]; then
 				urtt=$(rtt_avg_ms)
 				case "$urtt" in ''|*[!0-9]*) urtt=0 ;; esac
-				ubase=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
-				case "$ubase" in ''|*[!0-9]*) ubase=0 ;; esac
-				uthr=$(( ubase * 4 / 10 ))
-				[ "$uthr" -lt 20 ] && uthr=20
-				newup=$up
+				# Same protection as the downlink: three windows in a row with
+				# no answer at all mean the probe target is unusable (wrong
+				# address, ICMP filtered), not that the line is slow. Without
+				# it the uplink walked itself to the 2 Mbit floor at -15% per
+				# window and stayed there, unreachable except by restarting.
 				if [ "$urtt" -eq 0 ]; then
-					newup=$(( up * 85 / 100 ))
-				elif [ "$ubase" -gt 0 ] && [ "$urtt" -gt $(( ubase + 80 )) ]; then
-					# proportional, at most -12% per window
-					newup=$(( up * (ubase + 40) / urtt ))
-					[ "$newup" -gt $(( up * 88 / 100 )) ] && newup=$(( up * 88 / 100 ))
-				elif [ "$ubase" -gt 0 ] && [ "$urtt" -le $(( ubase + uthr )) ]; then
-					newup=$(( up * 103 / 100 ))
-					[ "$newup" -gt 200000 ] && newup=200000
+					upmiss=$(( upmiss + 1 ))
+				else
+					upmiss=0
 				fi
-				[ "$newup" -lt 2000 ] && newup=2000
-				if [ "$newup" -ne "$up" ]; then
-					if apply_uplink_rate "$dev" "$newup"; then
-						printf '%s\n' "$newup" > "$PRIO_STATE/up_rate"
-						logger -t luci-app-prio "uplink ${up} -> ${newup}kbit (rtt ${urtt}ms, idle ${ubase}ms)"
+				if [ "$upmiss" -ge 3 ]; then
+					grep -q 'probe:down' "$PRIO_STATE/status" 2>/dev/null ||
+						echo "probe:down" >> "$PRIO_STATE/status"
+				fi
+				if [ "$upmiss" -lt 3 ]; then
+					ubase=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
+					case "$ubase" in ''|*[!0-9]*) ubase=0 ;; esac
+					uthr=$(( ubase * 4 / 10 ))
+					[ "$uthr" -lt 20 ] && uthr=20
+					newup=$up
+					if [ "$urtt" -eq 0 ]; then
+						newup=$(( up * 85 / 100 ))
+					elif [ "$ubase" -gt 0 ] && [ "$urtt" -gt $(( ubase + 80 )) ]; then
+						# proportional, at most -12% per window
+						newup=$(( up * (ubase + 40) / urtt ))
+						[ "$newup" -gt $(( up * 88 / 100 )) ] && newup=$(( up * 88 / 100 ))
+					elif [ "$ubase" -gt 0 ] && [ "$urtt" -le $(( ubase + uthr )) ]; then
+						newup=$(( up * 103 / 100 ))
+						[ "$newup" -gt 200000 ] && newup=200000
+					fi
+					[ "$newup" -lt 2000 ] && newup=2000
+					if [ "$newup" -ne "$up" ]; then
+						if apply_uplink_rate "$dev" "$newup"; then
+							set_up_rate "$newup"
+							logger -t luci-app-prio "uplink ${up} -> ${newup}kbit (rtt ${urtt}ms, idle ${ubase}ms)"
+						fi
 					fi
 				fi
 			fi
@@ -1408,15 +1502,33 @@ start() {
 	case "$pf" in ''|*[!0-9]*) pf=0 ;; esac
 	lf="$(state_get shaper_learned)"
 	case "$lf" in ''|*[!0-9]*) lf=0 ;; esac
-	# The uplink controller keeps its live value in tmpfs; turning the uplink
-	# shaping off (uplink_kbit=0) has to throw it away, otherwise the old value
-	# keeps shaping after a reload.
-	local upcfg
+	# The uplink controller keeps its live value in tmpfs, which a reboot wipes.
+	# uplink_kbit=0 means AUTOMATIC in this build, not "off", so the learned
+	# value has to survive a save/reload here -- otherwise every "apply" dropped
+	# the uplink back to the open 1 Gbit tree (queue into the modem, priority
+	# dead) and the page still claimed it was measuring.
+	local upcfg ul uf
 	upcfg="$(state_get uplink_kbit)"
 	case "$upcfg" in ''|*[!0-9]*) upcfg=0 ;; esac
-	if [ "$upcfg" -lt 1000 ]; then
-		: > "$PRIO_STATE/up_rate"
+	uf="$(cat "$PRIO_STATE/up_rate" 2>/dev/null)"
+	case "$uf" in ''|*[!0-9]*) uf=0 ;; esac
+	ul="$(state_get uplink_learned)"
+	case "$ul" in ''|*[!0-9]*) ul=0 ;; esac
+	if [ "$upcfg" -ge 1000 ]; then
+		# A manual rate is the user's decision and is used verbatim. Seed the
+		# live value from it (the loop may trim it) and forget anything learned
+		# under a different config, so a higher learned value can never shadow it.
+		set_up_rate "$upcfg"
+		uf=$upcfg
 		: > "$PRIO_STATE/uptx"
+		[ "$ul" -gt 0 ] && state_set uplink_learned ""
+	elif [ "$uf" -lt 1000 ] && [ "$ul" -ge 2000 ]; then
+		# Fresh boot: start shaping at the rate learned last time instead of
+		# running open for the first three windows.
+		set_up_rate "$ul"
+		uf=$ul
+	elif [ "$uf" -ge 2000 ] && [ "$uf" -ne "$ul" ]; then
+		state_set uplink_learned "$uf"
 	fi
 
 	# "forget the learned rate" deletes both keys; anything left in tmpfs must
@@ -1444,6 +1556,11 @@ start() {
 		# Both keys: the detector starts from whichever is larger, so leaving
 		# the peak behind would keep the old line's rate on the new interface.
 		state_set shaper_peak ""
+		# Same reasoning for the uplink: a rate learned on the old WAN would
+		# carve the new one wrong, and it only ever climbs by 3% per window.
+		state_set uplink_learned ""
+		: > "$PRIO_STATE/up_rate"
+		: > "$PRIO_STATE/uptx"
 	fi
 
 	# The uplink and downlink hooks must be on different interfaces.
