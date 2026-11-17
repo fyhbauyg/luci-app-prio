@@ -367,9 +367,6 @@ msgstr "最低带，带 %d（推荐）"
 msgid "no local backlog in the last window -- traffic never exceeded the shaping rate. Normal on a quiet line; also what a rate set above the line's real capacity looks like."
 msgstr "上一窗口内本地没有积压——流量一直没超过整形速率。线路空闲时这是正常的，但整形速率高于线路真实能力时也是这个样子。"
 
-msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test under half cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
-msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。如果上一次测量至少有 5 Mbit/s，一天之内低于它一半的结果会被忽略，这样一次被限速的测速不会把速率钉死；真的降速了得等过这一天，或者关掉自动测量手动填速率。"
-
 msgid "another measurement is still running"
 msgstr "另一次测量正在运行"
 
@@ -387,3 +384,15 @@ msgstr "不到上次测量的一半，已忽略"
 
 msgid "last attempt failed: %s (%s)"
 msgstr "上次测量失败：%s（%s）"
+
+msgid "measurement running now (about a minute)"
+msgstr "正在测量（大约 1 分钟）"
+
+msgid "the upload measured under half of the last one, so it was ignored"
+msgstr "上传不到上次测量的一半，已忽略"
+
+msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. Clicking returns immediately; the test itself runs in the background, so reload this page in a minute to see the result. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test under half cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
+msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。点一下立刻返回，测速在后台进行，过一分钟刷新本页就能看到结果。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。如果上一次测量至少有 5 Mbit/s，一天之内低于它一半的结果会被忽略，这样一次被限速的测速不会把速率钉死；真的降速了得等过这一天，或者关掉自动测量手动填速率。"
+
+msgid "the priority engine is switched off"
+msgstr "优先级引擎已关闭"

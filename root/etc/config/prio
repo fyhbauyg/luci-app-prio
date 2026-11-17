@@ -44,4 +44,7 @@ config main 'main'
 	option measured_dl ''
 	option measured_ul ''
 	option measured_at ''
+	# The upload has its own timestamp: measured_at belongs to the download and
+	# is refreshed by every accepted download, so the upload guard cannot use it.
+	option measured_at_up ''
 	option uplink_learned ''

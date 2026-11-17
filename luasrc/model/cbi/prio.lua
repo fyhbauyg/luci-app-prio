@@ -349,7 +349,9 @@ o.cfgvalue = function()
 
 	local function ago(ts)
 		local d = os.time() - ts
-		if d < 0 then return "" end
+		-- A clock that stepped backwards must read as "just now", not as an
+		-- empty parenthetical nor as a dangling separator.
+		if d < 0 then d = 0 end
 		if d < 120 then return translate("just now") end
 		if d < 7200 then return string.format(translate("%d minutes ago"), math.floor(d / 60)) end
 		return string.format(translate("%d hours ago"), math.floor(d / 3600))
@@ -359,7 +361,16 @@ o.cfgvalue = function()
 	-- lock and a dead speedtest client all look like a button that does
 	-- nothing at all. The reasons are written by measure() in the init script.
 	local note = ""
-	if fs.access("/var/run/luci-app-prio/measure_err") then
+	-- The measurement runs in the background now, so the page has to say that
+	-- one is in progress instead of showing a stale number with no explanation.
+	-- Existence alone is not enough: a run killed outright (SIGKILL, watchdog)
+	-- leaves the marker behind and the page would claim "running" forever.
+	local running = false
+	local mst = fs.stat("/var/run/luci-app-prio/measuring")
+	if mst and mst.mtime and (os.time() - mst.mtime) < 120 then running = true end
+	if running then
+		note = "  ·  " .. translate("measurement running now (about a minute)")
+	elseif fs.access("/var/run/luci-app-prio/measure_err") then
 		local ets, code = (fs.readfile("/var/run/luci-app-prio/measure_err") or ""):match("^(%d+)%s+(%S+)")
 		ets = tonumber(ets) or 0
 		-- Literal translate() calls on purpose: a table of strings translated
@@ -375,12 +386,18 @@ o.cfgvalue = function()
 			why = translate("the WAN interface was missing")
 		elseif code == "rejected" then
 			why = translate("under half of the last one, so it was ignored")
+		elseif code == "rejected-up" then
+			why = translate("the upload measured under half of the last one, so it was ignored")
+		elseif code == "disabled" then
+			why = translate("the priority engine is switched off")
 		end
 		-- Only when it is newer than the number above: a stale note next to a
 		-- fresh measurement would read like a contradiction.
-		if why and ets > t0 then
+		-- >= : a rejection can share the second with an accepted download, and
+		-- the note must still show then.
+		if why and ets >= t0 then
 			note = "  ·  " .. string.format(translate("last attempt failed: %s (%s)"),
-				translate(why), ago(ets))
+				why, ago(ets))
 		end
 	end
 
@@ -388,8 +405,10 @@ o.cfgvalue = function()
 		if note ~= "" then return translate("not measured yet") .. note end
 		return translate("not measured yet")
 	end
+	local text = string.format("%.1f Mbit/s ↓  ·  %.1f Mbit/s ↑", dl / 1000, ul / 1000)
 	local age = t0 > 0 and ago(t0) or ""
-	return string.format("%.1f Mbit/s ↓  ·  %.1f Mbit/s ↑  ·  %s", dl / 1000, ul / 1000, age) .. note
+	if age ~= "" then text = text .. "  ·  " .. age end
+	return text .. note
 end
 
 o = s:option(Button, "_measure", translate("Measured capacity"))
@@ -398,16 +417,19 @@ o.inputstyle = "reload"
 o.description = translate("Uses the built-in speedtest client: it picks a mainland node " ..
 	"(Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the " ..
 	"line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. " ..
+	"Clicking returns immediately; the test itself runs in the background, so " ..
+	"reload this page in a minute to see the result. " ..
 	"With \"Measure the line automatically\" on and the line idle, a successful run " ..
 	"replaces the remembered rate. A result under half of the previous one within a " ..
 	"day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled " ..
 	"test under half cannot pin the line; a genuine downgrade needs that day to pass, or " ..
 	"switch automatic measurement off and type the rate in by hand.")
 o.write = function()
-	-- One measurement, not two. This used to run it inline and then again in a
-	-- background subshell, which charged the line for two full runs.
-	require("luci.sys").call("/etc/init.d/prio measure >/dev/null 2>&1")
-	require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")
+	-- Detached on purpose: one run takes up to a minute and the old code made
+	-- the browser wait for it, which a proxy or a slow phone turns into a
+	-- timeout. The row above reports progress and the result.
+	require("luci.sys").call(
+		"( /etc/init.d/prio measure; /etc/init.d/prio apply 1 ) </dev/null >/dev/null 2>&1 &")
 end
 
 o = s:option(Flag, "downlink", translate("Shape Downlink (download)"))

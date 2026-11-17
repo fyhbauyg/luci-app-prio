@@ -58,9 +58,11 @@ state_set() { uci -q set "prio.main.$1=$2" && uci -q commit prio; }
 # old numbers in place makes the button look dead, so the reason is recorded
 # here and the page reports it next to the last measurement.
 mea_fail() {
-	printf '%s %s\n' "$(date +%s)" "$1" > "$PRIO_STATE/measure_err" 2>/dev/null
+	mkdir -p "$PRIO_STATE" 2>/dev/null
+	printf '%s %s\n' "${MEASURE_NOW:-$(date +%s)}" "$1" > "$PRIO_STATE/measure_err" 2>/dev/null
 }
 mea_ok() {
+	mkdir -p "$PRIO_STATE" 2>/dev/null
 	: > "$PRIO_STATE/measure_err" 2>/dev/null
 }
 
@@ -1461,8 +1463,19 @@ measure() {
 	[ "$secs" -gt 15 ] && secs=15
 	method="$(state_get measure_method)"
 	[ -n "$method" ] || method=auto
+	# Cleared up front: the early exits below record a reason through mea_fail,
+	# which would otherwise reuse the reading left by an earlier phase.
+	MEASURE_NOW=""
 
 	[ -e "/sys/class/net/$dev/statistics/rx_bytes" ] || { echo "measure:no-iface"; mea_fail no-iface; return 1; }
+	# A detached run outlives the click that started it, so it must refuse to
+	# spend hundreds of megabytes for a plugin the user has just switched off.
+	if [ "$(state_get enabled)" != "1" ]; then
+		echo "measure:disabled"
+		mea_fail disabled
+		logger -t luci-app-prio "measurement skipped: the engine is off"
+		return 1
+	fi
 
 	# Two measurements at once would each see the other's traffic; the marker
 	# also tells the detector to ignore its window. It is cleaned by a trap:
@@ -1592,15 +1605,41 @@ measure() {
 	case "$prev_dl" in ''|*[!0-9]*) prev_dl=0 ;; esac
 	prev_at="$(state_get measured_at)"
 	case "$prev_at" in ''|*[!0-9]*) prev_at=0 ;; esac
+	# One reading for both the guard notes and the timestamps below: taking two
+	# let the second tick over in between, and the note then looked older than
+	# the measurement it belongs to and was hidden.
+	MEASURE_NOW="$(date +%s)"
 	guard_reject=0
+	guard_reject_up=0
 	if [ "$dl" -ge 1000 ] && [ "$prev_dl" -ge 5000 ] &&
 	   [ $(( $(date +%s) - prev_at )) -lt 86400 ] &&
 	   [ "$dl" -lt $(( prev_dl * 50 / 100 )) ]; then
-		printf '%s\n' "$(date +%s)" > "$PRIO_STATE/measure_reject" 2>/dev/null
 		logger -t luci-app-prio "measurement ${dl}kbit is under half of ${prev_dl}kbit, ignored"
 		dl=$prev_dl
 		guard_reject=1
 		mea_fail rejected
+	fi
+	# The upload leg needs the same sanity check, and for a harder reason: an
+	# upload measurement that lands on a busy or badly peered node reports a
+	# fraction of the real rate, and since nothing in the control loop raises
+	# the uplink, one such sample pins the upload for good. That happened here
+	# -- 13 Mbit stored against a previous 133 -- and kept the uplink at 12.
+	prev_ul="$(state_get measured_ul)"
+	case "$prev_ul" in ''|*[!0-9]*) prev_ul=0 ;; esac
+	# Its OWN timestamp, not measured_at: that one describes the download and is
+	# refreshed by every accepted download, so using it here would restart this
+	# window on every good download and a genuine upload downgrade could never
+	# be accepted. An empty key (fresh install, upgrade) leaves the guard inert
+	# for one run, which is the safe direction.
+	prev_ul_at="$(state_get measured_at_up)"
+	case "$prev_ul_at" in ''|*[!0-9]*) prev_ul_at=0 ;; esac
+	if [ "$ul" -ge 1000 ] && [ "$prev_ul" -ge 5000 ] && [ "$prev_ul_at" -gt 0 ] &&
+	   [ $(( $(date +%s) - prev_ul_at )) -lt 86400 ] &&
+	   [ "$ul" -lt $(( prev_ul * 50 / 100 )) ]; then
+		logger -t luci-app-prio "upload ${ul}kbit is under half of ${prev_ul}kbit, ignored"
+		ul=$prev_ul
+		guard_reject_up=1
+		mea_fail rejected-up
 	fi
 	dlok=0; ulok=0
 	[ "$dl" -ge 1000 ] && dlok=1
@@ -1617,17 +1656,22 @@ measure() {
 		# store the numbers even without the lock; the next start() will use them
 		state_set measured_dl "$dl"
 		state_set measured_ul "$ul"
-		# Same rules as below: a rejected result must not look fresh, and a
-		# stored one clears the previous failure note.
-		[ "$guard_reject" = 1 ] || state_set measured_at "$(date +%s)"
-		[ "$guard_reject" = 1 ] || mea_ok
+		# Same rules as below: only a real download measurement may refresh the
+		# timestamp, and a rejected result must not clear the failure note.
+		if [ "$dlok" = 1 ] && [ "$guard_reject" != 1 ]; then
+			state_set measured_at "$MEASURE_NOW"
+		fi
+		if [ "$ulok" = 1 ] && [ "$guard_reject_up" != 1 ]; then
+			state_set measured_at_up "$MEASURE_NOW"
+		fi
+		[ "$guard_reject" = 1 ] || [ "$guard_reject_up" = 1 ] || mea_ok
 		return 0
 	}
 	state_set measured_dl "$dl"
 	state_set measured_ul "$ul"
 	# A stored number clears the previous failure note; a rejected one keeps it,
 	# because nothing was learned and the page should still say why.
-	[ "$guard_reject" = 1 ] || mea_ok
+	[ "$guard_reject" = 1 ] || [ "$guard_reject_up" = 1 ] || mea_ok
 	# The timestamp describes the DOWNLOAD number (that is what the shaper uses
 	# and what the freshness checks read), so a failed download must not renew
 	# it -- otherwise an old value looks fresh forever.
@@ -1635,14 +1679,21 @@ measure() {
 	# reads this timestamp, so renewing it restarted the 24 h window on every
 	# rejected attempt and a genuinely slower line could never be accepted.
 	if [ "$dlok" = 1 ] && [ "$guard_reject" != 1 ]; then
-		state_set measured_at "$(date +%s)"
+		state_set measured_at "$MEASURE_NOW"
+	fi
+	# ... and its upload counterpart describes the UPLOAD number, for the same
+	# reason: it must only move when the upload was actually believed.
+	if [ "$ulok" = 1 ] && [ "$guard_reject_up" != 1 ]; then
+		state_set measured_at_up "$MEASURE_NOW"
 	fi
 	# A fresh measurement replaces the rate, so the latency floor learned on
 	# the old path has to go with it: a stale baseline judges the new rate as
 	# congestion and cuts it for several windows before it re-learns. Truncated
 	# rather than deleted -- an empty file reads as 0, which is "not learned
 	# yet", and the loop takes a new sample from the next idle window.
-	if [ "$dlok" = 1 ]; then
+	# A rejected sample tells us nothing about the path, so it must not reset
+	# the baseline either -- the loop is still using it.
+	if [ "$dlok" = 1 ] && [ "$guard_reject" != 1 ]; then
 		: > "$PRIO_STATE/rtt_base"
 		: > "$PRIO_STATE/rtt_bad"
 	fi
@@ -1652,7 +1703,10 @@ measure() {
 		release_lock
 		return 0
 	fi
-	if [ "$(state_get auto_bandwidth)" = "1" ] && [ "$dlok" = 1 ]; then
+	# guard_reject: dl is the OLD number here, so applying it would overwrite the
+	# live cut the control loop made with a value the guard just called untrusted.
+	if [ "$(state_get auto_bandwidth)" = "1" ] && [ "$dlok" = 1 ] &&
+	   [ "$guard_reject" != 1 ]; then
 		# In automatic mode the measurement is the estimate. shaper_margin is
 		# applied on top of it when the rate is handed to tc, so the shaped
 		# value ends up at (100 - margin)% of what the line just delivered.
@@ -1667,7 +1721,10 @@ measure() {
 		local mup
 		mup="$(state_get uplink_kbit)"
 		case "$mup" in ''|*[!0-9]*) mup=0 ;; esac
-		if [ "$ulok" = 1 ] && [ "$ul" -ge 1000 ] && [ "$mup" -lt 1000 ] && [ "$(state_get uplink)" = "1" ]; then
+		# guard_reject_up: the number is the OLD one, re-applying it would
+		# overwrite the live cut the control loop made and raise the uplink.
+		if [ "$ulok" = 1 ] && [ "$guard_reject_up" != 1 ] &&
+		   [ "$ul" -ge 1000 ] && [ "$mup" -lt 1000 ] && [ "$(state_get uplink)" = "1" ]; then
 			# The uplink has no margin anywhere else in the chain, so it is
 			# applied here: shaping at the measured value itself puts the queue
 			# straight back into the modem.
@@ -1784,6 +1841,13 @@ start() {
 		state_set uplink_learned ""
 		: > "$PRIO_STATE/up_rate"
 		: > "$PRIO_STATE/uptx"
+		# The measurement baselines describe the old line; keeping them would
+		# compare the new WAN against the old one for a day.
+		state_set measured_dl ""
+		state_set measured_ul ""
+		state_set measured_at ""
+		state_set measured_at_up ""
+		: > "$PRIO_STATE/measure_err"
 	fi
 
 	# The uplink and downlink hooks must be on different interfaces.
@@ -1905,6 +1969,9 @@ stop() {
 
 	stop_detect
 	stop_refresh
+	# A measurement killed outright leaves its marker behind; while it exists the
+	# page says "measurement running" and the detector skips every window.
+	rm -f "$PRIO_STATE/measuring"
 	nft delete table $NFT_TABLE 2>/dev/null
 	nft delete table inet prio 2>/dev/null
 
