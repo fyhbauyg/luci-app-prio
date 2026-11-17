@@ -374,3 +374,9 @@ msgstr "填 0 表示自动；填数字请至少 1000 kbit/s：小于 1000 的值
 
 msgid "not shaped -- automatic learning is off (turn on automatic bandwidth or enter a rate)"
 msgstr "未整形 —— 自动学习已关闭（请开启自动带宽，或直接填写速率）"
+
+msgid "The latency probe target is not answering, so the rate is held at its last value instead of being adjusted. Pick a reachable target."
+msgstr "延迟探测目标没有回应，速率被保持在最后一次的值上、不再调节。请换一个能 ping 通的地址。"
+
+msgid "Enter a whole number in kbit/s, or 0 for automatic."
+msgstr "请填整数（kbit/s），或填 0 表示自动。"

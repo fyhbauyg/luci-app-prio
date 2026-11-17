@@ -19,6 +19,9 @@ config main 'main'
 	option rtt_target '223.5.5.5'
 	option saved_fastpath ''
 
-	# 0 = upload is not shaped. Set a value below the real upload rate
-	# to give the upload bands something to reorder.
+	# 0 = automatic: the upload stays open until the router has seen three
+	# clean measuring windows of real upload traffic, then it starts shaping
+	# at what the line delivered and the latency loop trims it. A number of
+	# 1000 or more pins the rate instead and the loop leaves it alone.
 	option uplink_kbit '0'
+	option uplink_learned ''

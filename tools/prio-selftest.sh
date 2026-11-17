@@ -83,8 +83,22 @@ else
 fi
 chk "队列状态文件存在" "test -f $ST/queue"
 # 5b. 上行学习值持久化 / 手动值权威（审计 B1、B2）
+# 这一段会临时改写 uplink_kbit / uplink_learned 以及 tmpfs 的 up_rate/up_cfg。
+# 全部先存下来，退出时（含 Ctrl-C、超时）原样写回，否则跑一次自测就会把
+# 用户真实学到的上行速率覆盖成测试值。审计 R1 复现过这个问题。
 UPK0=$(uci -q get prio.main.uplink_kbit)
 UPL0=$(uci -q get prio.main.uplink_learned)
+UR0=$(cat $ST/up_rate 2>/dev/null)
+UC0=$(cat $ST/up_cfg 2>/dev/null)
+restore_up() {
+	[ -n "$UPL0" ] && uci -q set prio.main.uplink_learned=$UPL0 || uci -q delete prio.main.uplink_learned
+	uci -q set prio.main.uplink_kbit=${UPK0:-0}
+	uci -q commit prio
+	if [ -n "$UR0" ]; then printf '%s\n' "$UR0" > $ST/up_rate; else rm -f $ST/up_rate; fi
+	if [ -n "$UC0" ]; then printf '%s\n' "$UC0" > $ST/up_cfg; else rm -f $ST/up_cfg; fi
+}
+trap 'restore_up' EXIT INT TERM
+
 uci -q set prio.main.uplink_learned=12345
 uci -q set prio.main.uplink_kbit=0
 uci -q commit prio
@@ -96,7 +110,7 @@ if [ "$PERS" -ge 10000 ] && [ "$PERS" -le 15000 ]; then
 else
 	no "上行学习值没有持久化 (期望 ~12345，实际 ${PERS} kbit)"
 fi
-chk "状态行在控制器改动后刷新为数值" "grep -qE '^upshaper:[0-9]+kbit' $ST/status"
+chk "上行状态行是具体数值而不是 auto" "grep -qE '^upshaper:[0-9]+kbit' $ST/status"
 
 uci -q set prio.main.uplink_kbit=5000
 uci -q commit prio
@@ -107,21 +121,27 @@ if [ "$MAN" -ge 4000 ] && [ "$MAN" -le 6000 ]; then
 else
 	no "手动值被学习值覆盖 (期望 ~5000，实际 ${MAN} kbit)"
 fi
-
-uci -q set prio.main.uplink_kbit=${UPK0:-0}
-if [ -n "$UPL0" ]; then
-	uci -q set prio.main.uplink_learned=$UPL0
+# 手动值必须钉住：等两个窗口，闭环不能把它改走
+sleep 45
+MAN2=$(rate_kbit $WAN); case "$MAN2" in ''|*[!0-9]*) MAN2=0 ;; esac
+if [ "$MAN2" -ge 4500 ] && [ "$MAN2" -le 5500 ]; then
+	ok "手动值在上行闭环跑过两个窗口后仍在 (${MAN2} kbit)"
 else
-	uci -q delete prio.main.uplink_learned
+	no "闭环把手动值改掉了 (5000 -> ${MAN2} kbit)"
 fi
-uci -q commit prio
+
+restore_up
+trap - EXIT INT TERM
 /etc/init.d/prio reload >/dev/null 2>&1; sleep 3
 
-# 5c. 探针不可达保护与种子策略必须在两条路径上都存在（B3、B4）
-chk "上行也有 upmiss 保护" "grep -q 'upmiss=' /etc/init.d/prio"
-chk "上行种子拒绝已堆积的窗口" "grep -q 'sclean' /etc/init.d/prio"
-chk "上行种子取中间值而非最大值" "grep -q 'sed -n 2p' /etc/init.d/prio"
-chk "上行状态行由 apply_uplink_rate 刷新" "grep -q 'upshaper:\${rate}kbit' /etc/init.d/prio"
+# 5c. 静态检查：这些是"代码里确实有这段逻辑"的存在性检查，不是行为断言。
+# 行为层面能自动验证的只有上面 B1/B2 两条；B3/B4 需要真实的上传/下载流量，
+# 在这里跑不出来，别把这几条当成功能已验证。
+chk "上行有 upmiss 保护代码" "grep -q 'upmiss=' /etc/init.d/prio"
+chk "上行种子拒绝已堆积的窗口 (sclean)" "grep -q 'sclean' /etc/init.d/prio"
+chk "上行种子取中间值 (sed -n 2p)" "grep -q 'sed -n 2p' /etc/init.d/prio"
+chk "种子采样要求 4/4 全应答 (rtt_all_ms)" "grep -q 'rtt_all_ms' /etc/init.d/prio"
+chk "上行状态行有多处写入点 (apply 与 setup)" "[ \$(grep -c 'upshaper:' /etc/init.d/prio) -ge 3 ]"
 
 
 # 6. 分类规则

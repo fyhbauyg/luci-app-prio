@@ -298,6 +298,15 @@ local function attention()
 		return translate("Only classification is installed, no queue yet -- priority is not " ..
 			"in effect. Start a download so the rate can be learned, or set a fixed rate.")
 	end
+	-- The controller holds the rate when the probe target stops answering.
+	-- Without this line a silent hold looks exactly like "priority is broken".
+	if fs.access("/var/run/luci-app-prio/status") then
+		local st = fs.readfile("/var/run/luci-app-prio/status") or ""
+		if st:find("probe:down", 1, true) then
+			return translate("The latency probe target is not answering, so the rate is " ..
+				"held at its last value instead of being adjusted. Pick a reachable target.")
+		end
+	end
 	return nil
 end
 
@@ -526,6 +535,10 @@ o.write = function()
 	-- otherwise the three samples collected before the button was pressed
 	-- seed the uplink again on the next window
 	os.remove("/var/run/luci-app-prio/uptx")
+	-- "last rate that worked" memories: keeping them would make the controller
+	-- jump straight back to a rate measured on a line that no longer exists.
+	os.remove("/var/run/luci-app-prio/rate_good")
+	os.remove("/var/run/luci-app-prio/up_good")
 	-- The detector keeps its live estimate in tmpfs and start() folds it back
 	-- into the config, so leaving this file makes "forget" a no-op.
 	os.remove("/var/run/luci-app-prio/peak")
@@ -545,6 +558,12 @@ o.placeholder = "0"
 -- the user typed would look accepted and then quietly be ignored.
 o.validate = function(self, value)
 	if not value or value == "" then return value end
+	-- Keep the uinteger check: overriding validate() replaces the datatype
+	-- one, so "5000.7" would otherwise reach the backend, fail its digit test
+	-- there and be read as 0 = automatic.
+	if not value:match("^%s*%d+%s*$") then
+		return nil, translate("Enter a whole number in kbit/s, or 0 for automatic.")
+	end
 	local n = tonumber(value)
 	if n and n > 0 and n < 1000 then
 		return nil, translate("Use 0 for automatic, or at least 1000 kbit/s: " ..

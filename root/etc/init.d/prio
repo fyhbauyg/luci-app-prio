@@ -498,8 +498,8 @@ apply_uplink_rate() {
 	# measuring" forever. Rewrite the line, dropping the previous one first so
 	# repeated windows do not accumulate.
 	if [ -f "$PRIO_STATE/status" ]; then
-		grep -vE '^upshaper:' "$PRIO_STATE/status" > "$PRIO_STATE/status.tmp" 2>/dev/null
-		mv "$PRIO_STATE/status.tmp" "$PRIO_STATE/status" 2>/dev/null
+		grep -vE '^upshaper:' "$PRIO_STATE/status" > "$PRIO_STATE/status.$$" 2>/dev/null
+		mv "$PRIO_STATE/status.$$" "$PRIO_STATE/status" 2>/dev/null
 	fi
 	echo "upshaper:${rate}kbit" >> "$PRIO_STATE/status"
 	return 0
@@ -586,8 +586,8 @@ setup_downlink() {
 	# Strip our own lines before re-emitting them; the detector calls this
 	# repeatedly and must not accumulate duplicate status rows.
 	if [ -f "$PRIO_STATE/status" ]; then
-		grep -vE '^(shaper|downlink|lanq):' "$PRIO_STATE/status" > "$PRIO_STATE/status.tmp" 2>/dev/null
-		mv "$PRIO_STATE/status.tmp" "$PRIO_STATE/status" 2>/dev/null
+		grep -vE '^(shaper|downlink|lanq):' "$PRIO_STATE/status" > "$PRIO_STATE/status.$$" 2>/dev/null
+		mv "$PRIO_STATE/status.$$" "$PRIO_STATE/status" 2>/dev/null
 	fi
 
 	qdisc_is_ours "$dev" && tc qdisc del dev "$dev" root 2>/dev/null
@@ -618,7 +618,10 @@ setup_downlink() {
 		# per-flow fairness the band classes get, otherwise a single local flow
 		# can starve the rest of the bridge.
 		tc qdisc add dev "$dev" parent 1:1 fq_codel 2>>"$PRIO_STATE/err"
-		if ! tc class add dev "$dev" parent 1: classid 1:100 htb rate "${applied}kbit" ceil "${applied}kbit" burst "${burst}b" 2>>"$PRIO_STATE/err"; then
+		# cburst must be set explicitly: tc defaults it to 1600 bytes, which
+		# starves the burst at exactly the moment a download ramps up.
+		if ! tc class add dev "$dev" parent 1: classid 1:100 htb rate "${applied}kbit" ceil "${applied}kbit" \
+			burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"; then
 			tc qdisc del dev "$dev" root 2>/dev/null
 			echo "downlink:fail" >> "$PRIO_STATE/status"
 			return 1
@@ -791,6 +794,34 @@ rtt_avg_ms() {
 	out="$(ping -c 4 -W 1 "$target" 2>/dev/null | \
 		awk -F'= ' '/round-trip/{split($2,a,"/"); print int(a[2]+0); exit}')"
 	case "$out" in ''|*[!0-9]*) echo 0 ;; *) echo "$out" ;; esac
+}
+
+# Same as rtt_avg_ms, but only when every probe came back. A saturated 4G
+# uplink very often answers exactly one of four pings; taking the average of
+# that one reply makes a window full of queue look healthy, which is how a
+# supply-limited sample passed the "modem is not queueing" test.
+rtt_all_ms() {
+	local target out tx rx
+	target="$(state_get rtt_target)"
+	[ -n "$target" ] || target=223.5.5.5
+	out="$(ping -c 4 -W 1 "$target" 2>/dev/null)"
+	tx="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9]*\) packets transmitted.*/\1/p')"
+	rx="$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9]*\) received.*/\1/p')"
+	tx="${tx:-0}"; rx="${rx:-0}"
+	case "$tx$rx" in ''|*[!0-9]*) echo 0; return ;; esac
+	[ "$tx" -gt 0 ] && [ "$rx" = "$tx" ] || { echo 0; return; }
+	out="$(printf '%s\n' "$out" | awk -F'= ' '/round-trip/{split($2,a,"/"); print int(a[2]+0); exit}')"
+	case "$out" in ''|*[!0-9]*) echo 0 ;; *) echo "$out" ;; esac
+}
+
+# Drop the "probe target unreachable" marker once answers are back, otherwise
+# the page keeps claiming a problem that no longer exists.
+clear_probe_down() {
+	[ -f "$PRIO_STATE/status" ] || return 0
+	grep -q '^probe:down$' "$PRIO_STATE/status" 2>/dev/null || return 0
+	grep -vE '^probe:down$' "$PRIO_STATE/status" > "$PRIO_STATE/status.$$" 2>/dev/null &&
+		mv "$PRIO_STATE/status.$$" "$PRIO_STATE/status" 2>/dev/null
+	return 0
 }
 
 rtt_min_ms() {
@@ -1011,7 +1042,7 @@ start_detect() {
 			# blown up is exactly that case -- the queue sits in the modem and
 			# the number is meaningless. Discard it and wait for a clean one.
 			if [ "$up" -lt 1000 ] && [ "$thr_up" -gt 3000 ]; then
-				srtt=$(rtt_avg_ms)
+				srtt=$(rtt_all_ms)
 				case "$srtt" in ''|*[!0-9]*) srtt=0 ;; esac
 				sbase=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
 				case "$sbase" in ''|*[!0-9]*) sbase=0 ;; esac
@@ -1031,17 +1062,19 @@ start_detect() {
 					tail -n 3 "$PRIO_STATE/uptx" > "$PRIO_STATE/uptx.tmp" 2>/dev/null &&
 						mv "$PRIO_STATE/uptx.tmp" "$PRIO_STATE/uptx" 2>/dev/null
 					# The middle of three windows, not the largest: one burst
-					# must never become the seed. Then the same safety margin
-					# the downlink uses, because a seed above the real capacity
-					# puts the queue straight back into the modem.
+					# must never become the seed. The gate is on the raw
+					# sample, before the margin, otherwise a 3-5 Mbit 4G
+					# uplink can never seed at all (10% margin pushed the
+					# smallest useful value under the threshold).
 					useed=$(sort -n "$PRIO_STATE/uptx" 2>/dev/null | sed -n 2p)
 					case "$useed" in ''|*[!0-9]*) useed=0 ;; esac
-					umarg=$(margin_pct)
-					[ "$useed" -ge 1000 ] && useed=$(( useed * (100 - umarg) / 100 ))
-					[ "$useed" -gt "$ceiling" ] && useed=$ceiling
 					nup=$(wc -l < "$PRIO_STATE/uptx" 2>/dev/null)
 					case "$nup" in ''|*[!0-9]*) nup=0 ;; esac
-					if [ "$nup" -ge 3 ] && [ "$useed" -ge 5000 ]; then
+					if [ "$nup" -ge 3 ] && [ "$useed" -ge 3000 ]; then
+						umarg=$(margin_pct)
+						useed=$(( useed * (100 - umarg) / 100 ))
+						[ "$useed" -lt 2000 ] && useed=2000
+						[ "$useed" -gt "$ceiling" ] && useed=$ceiling
 						if apply_uplink_rate "$dev" "$useed"; then
 							set_up_rate "$useed"
 							up=$useed
@@ -1050,7 +1083,16 @@ start_detect() {
 					fi
 				fi
 			fi
-			if [ "$up" -ge 1000 ] && [ "$thr_up" -gt 1500 ]; then
+			# A manual rate is a number the user pinned; the closed loop must
+			# not move it (up or down), and the same is true for the downlink
+			# when automatic learning is off. Everything below only runs in
+			# automatic mode.
+			manual_up=$(state_get uplink_kbit)
+			case "$manual_up" in ''|*[!0-9]*) manual_up=0 ;; esac
+			# Idle uplink: an old miss count would otherwise carry over and
+			# make the next single lost probe look like three in a row.
+			[ "$thr_up" -le 1500 ] && upmiss=0
+			if [ "$up" -ge 1000 ] && [ "$thr_up" -gt 1500 ] && [ "$manual_up" -lt 1000 ]; then
 				urtt=$(rtt_avg_ms)
 				case "$urtt" in ''|*[!0-9]*) urtt=0 ;; esac
 				# Same protection as the downlink: three windows in a row with
@@ -1062,6 +1104,7 @@ start_detect() {
 					upmiss=$(( upmiss + 1 ))
 				else
 					upmiss=0
+					clear_probe_down
 				fi
 				if [ "$upmiss" -ge 3 ]; then
 					grep -q 'probe:down' "$PRIO_STATE/status" 2>/dev/null ||
@@ -1073,14 +1116,28 @@ start_detect() {
 					uthr=$(( ubase * 4 / 10 ))
 					[ "$uthr" -lt 20 ] && uthr=20
 					newup=$up
+					ug=$(cat "$PRIO_STATE/up_good" 2>/dev/null)
+					case "$ug" in ''|*[!0-9]*) ug=0 ;; esac
 					if [ "$urtt" -eq 0 ]; then
 						newup=$(( up * 85 / 100 ))
 					elif [ "$ubase" -gt 0 ] && [ "$urtt" -gt $(( ubase + 80 )) ]; then
-						# proportional, at most -12% per window
+						# same bounds as the downlink: at least -15%, at most -30%
 						newup=$(( up * (ubase + 40) / urtt ))
-						[ "$newup" -gt $(( up * 88 / 100 )) ] && newup=$(( up * 88 / 100 ))
+						[ "$newup" -gt $(( up * 85 / 100 )) ] && newup=$(( up * 85 / 100 ))
+						[ "$newup" -lt $(( up * 70 / 100 )) ] && newup=$(( up * 70 / 100 ))
+						[ "$ug" -gt $(( up * 3 / 2 )) ] &&
+							printf '%s\n' $(( up * 3 / 2 )) > "$PRIO_STATE/up_good"
 					elif [ "$ubase" -gt 0 ] && [ "$urtt" -le $(( ubase + uthr )) ]; then
-						newup=$(( up * 103 / 100 ))
+						if [ "$up" -gt "$ug" ]; then
+							ug=$up
+							printf '%s\n' "$ug" > "$PRIO_STATE/up_good"
+						fi
+						if [ "$ug" -gt "$up" ]; then
+							newup=$(( up * 120 / 100 ))
+							[ "$newup" -gt "$ug" ] && newup=$ug
+						else
+							newup=$(( up * 112 / 100 ))
+						fi
 						[ "$newup" -gt 200000 ] && newup=200000
 					fi
 					[ "$newup" -lt 2000 ] && newup=2000
@@ -1127,6 +1184,7 @@ start_detect() {
 				downmiss=$(( downmiss + 1 ))
 			else
 				downmiss=0
+				clear_probe_down
 			fi
 			if [ "$downmiss" -ge 3 ]; then
 				grep -q 'probe:down' "$PRIO_STATE/status" 2>/dev/null ||
@@ -1134,13 +1192,39 @@ start_detect() {
 				continue
 			fi
 			newrate=$rate
+			# rate_good is the highest rate that a window has already proved
+			# deliverable. Climbing back to it is fast, because one bad sample
+			# must not leave the line running at a third of its capacity for
+			# half an hour -- observed: 20529 -> 5896 kbit from a single 188 ms
+			# sample, then +3% per busy window while the line kept delivering
+			# 20+ Mbit to everything else.
+			rg=$(cat "$PRIO_STATE/rate_good" 2>/dev/null)
+			case "$rg" in ''|*[!0-9]*) rg=0 ;; esac
 			if [ "$rtt" -eq 0 ]; then
 				newrate=$(( rate * 80 / 100 ))
 			elif [ "$base" -gt 0 ] && [ "$rtt" -gt $(( base + 80 )) ]; then
+				# Proportional, but bounded on both sides: at least -15% and at
+				# most -30% in one window. The old unbounded ratio turned one
+				# spike into a 71% cut.
 				newrate=$(( rate * (base + 40) / rtt ))
-				[ "$newrate" -gt $(( rate * 88 / 100 )) ] && newrate=$(( rate * 88 / 100 ))
+				[ "$newrate" -gt $(( rate * 85 / 100 )) ] && newrate=$(( rate * 85 / 100 ))
+				[ "$newrate" -lt $(( rate * 70 / 100 )) ] && newrate=$(( rate * 70 / 100 ))
+				# A cut means the remembered ceiling was optimistic; decay it
+				# instead of keeping a stale high value to bounce back to.
+				[ "$rg" -gt $(( rate * 3 / 2 )) ] &&
+					printf '%s\n' $(( rate * 3 / 2 )) > "$PRIO_STATE/rate_good"
 			elif [ "$base" -gt 0 ] && [ "$rtt" -le $(( base + up_thr_hi )) ]; then
-				newrate=$(( rate * 103 / 100 ))
+				if [ "$rate" -gt "$rg" ]; then
+					rg=$rate
+					printf '%s\n' "$rg" > "$PRIO_STATE/rate_good"
+				fi
+				if [ "$rg" -gt "$rate" ]; then
+					# below a rate already proven a moment ago: climb at 20%
+					newrate=$(( rate * 120 / 100 ))
+					[ "$newrate" -gt "$rg" ] && newrate=$rg
+				else
+					newrate=$(( rate * 112 / 100 ))
+				fi
 				[ "$newrate" -gt "$ceiling" ] && newrate=$ceiling
 			fi
 			[ "$newrate" -lt 2000 ] && newrate=2000
@@ -1561,6 +1645,9 @@ start() {
 		state_set uplink_learned ""
 		: > "$PRIO_STATE/up_rate"
 		: > "$PRIO_STATE/uptx"
+		# The "last rate that worked" memories belong to the old link.
+		: > "$PRIO_STATE/rate_good"
+		: > "$PRIO_STATE/up_good"
 	fi
 
 	# The uplink and downlink hooks must be on different interfaces.
@@ -1664,6 +1751,16 @@ stop() {
 	fi
 
 	# Keep $PRIO_STATE/shaper: reload() must not throw away the learned rate.
+	# Same for the uplink: a clean shutdown should not cost the last rate the
+	# loop found, otherwise every reboot restarts the upload at "open".
+	local uf upm
+	uf="$(cat "$PRIO_STATE/up_rate" 2>/dev/null)"
+	case "$uf" in ''|*[!0-9]*) uf=0 ;; esac
+	upm="$(state_get uplink_kbit)"
+	case "$upm" in ''|*[!0-9]*) upm=0 ;; esac
+	if [ "$upm" -lt 1000 ] && [ "$uf" -ge 2000 ]; then
+		state_set uplink_learned "$uf"
+	fi
 	: > "$PRIO_STATE/status" 2>/dev/null
 	logger -t luci-app-prio "priority engine stopped"
 }
