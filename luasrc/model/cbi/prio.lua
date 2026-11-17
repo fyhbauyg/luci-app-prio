@@ -60,7 +60,7 @@ end
 m = Map("prio", translate("Device Priority"),
 	translate("Give selected devices network priority. The downlink shaper limits the " ..
 		"connection below the line's real speed so the router can queue and reorder " ..
-		"packets; it learns that speed from real traffic, or you calibrate it once and " ..
+		"packets; it measures the line itself, or you type the rate in once and " ..
 		"use a fixed rate. Packets are marked before NAT so the classification survives " ..
 		"address translation."))
 
@@ -391,9 +391,10 @@ o.validate = function(self, value)
 	end
 	return value
 end
-o.description = translate("Used by the calibration below to measure how much latency each " ..
-	"rate costs. Pick a stable public address near you; an unreachable one makes the " ..
-	"calibration table useless.")
+o.description = translate("The shaper watches the round trip to this address: while it " ..
+	"stays near the idle baseline the rate is left alone, when it climbs the rate comes " ..
+	"down. Pick a stable public address near you; an unreachable one only produces a " ..
+	"warning, because the shaper then has nothing to read.")
 
 -- The picker shells out to traceroute, which is no longer a hard dependency
 -- (the package name did not exist in the firmware feed and made apk refuse the
@@ -408,7 +409,7 @@ do
 end
 
 if has_traceroute then
-o = s:option(Button, "_pick_probe", translate("Latency probe target"))
+o = s:option(Button, "_pick_probe", translate("Pick the probe target"))
 o.inputtitle = translate("Pick the closest hop automatically")
 o.inputstyle = "reload"
 o.description = translate("Runs one traceroute and uses the nearest hop that also answers a " ..
@@ -418,7 +419,7 @@ o.write = function()
 	require("luci.sys").call("/etc/init.d/prio pickprobe >/dev/null 2>&1")
 end
 else
-o = s:option(DummyValue, "_pick_probe_off", translate("Latency probe target"))
+o = s:option(DummyValue, "_pick_probe_off", translate("Pick the probe target"))
 o.cfgvalue = function()
 	return translate("automatic pick unavailable: traceroute is not installed")
 end
@@ -430,63 +431,9 @@ o.default = 10
 o.datatype = "range(0,100)"
 o.rmempty = false
 o.description = translate("How far below the measured capacity to run, in percent. " ..
-	"Only the learned value is reduced; a rate typed in by hand is used exactly as typed. " ..
-	"Bigger means a deeper local queue (priority bites harder) but less peak throughput. " ..
-	"Adopting a calibration result switches to a fixed rate, where this has no effect.")
-
-o = s:option(Button, "_calib_run", translate("Calibration"))
-o.inputtitle = translate("Run calibration (about 3 minutes)")
-o.inputstyle = "reload"
-o.description = translate("Sweeps the shaping rate while a real download runs and records " ..
-	"what the line actually delivers and how much latency it costs at each step. " ..
-	"Start a download first. On a line whose speed swings a lot, the fixed rate this " ..
-	"produces is steadier than the automatic estimate.")
-o.write = function()
-	require("luci.sys").call("/etc/init.d/prio calibrate >/dev/null 2>&1 &")
-end
-
--- The suggestion only exists after a successful calibration, so the button is
--- only rendered when there is something to adopt. The old version always
--- rendered it and matched "^%s*(%d+)%%s*$": in a Lua pattern "%%" is a literal
--- '%', so a bare number never matched and the click did nothing at all.
-local calib_hint = nil
-if fs.access("/var/run/luci-app-prio/calib_suggest") then
-	calib_hint = (fs.readfile("/var/run/luci-app-prio/calib_suggest") or ""):gsub("%s+", "")
-	-- 5000 kbit/s is the floor: a "suggestion" below that means the sweep ran
-	-- without a download and produced a number that would strangle the line.
-	if not calib_hint:match("^%d+$") or tonumber(calib_hint) < 5000 then
-		calib_hint = nil
-	end
-end
-
-if calib_hint then
-	o = s:option(Button, "_calib_apply", translate("Calibration suggestion"))
-	o.inputtitle = translatef("Adopt %d Mbit/s and stop learning",
-		math.floor(tonumber(calib_hint) / 1000))
-	o.inputstyle = "reload"
-	o.description = translate("Switches to a fixed rate equal to the calibrated value and " ..
-		"turns automatic learning off. Re-run the calibration when the line changes.")
-	o.write = function()
-		local u = require("luci.model.uci").cursor()
-		u:set("prio", "main", "auto_bandwidth", "0")
-		u:set("prio", "main", "shaper_kbit", calib_hint)
-		u:commit("prio")
-		os.remove("/var/run/luci-app-prio/calib_suggest")
-		require("luci.sys").call("/etc/init.d/prio apply 1 >/dev/null 2>&1 &")
-	end
-end
-
-o = s:option(TextValue, "_calib")
-o.title = translate("Calibration result")
-o.rows = 14
-o.readonly = true
-o.cfgvalue = function()
-	if not fs.access("/var/run/luci-app-prio/calib.txt") then
-		return translate("No calibration has been run yet.")
-	end
-	return (fs.readfile("/var/run/luci-app-prio/calib.txt") or "")
-end
-o.write = function() end
+	"Only the measured value is reduced; a rate typed in by hand is used exactly as " ..
+	"typed. Bigger means a deeper local queue (priority bites harder) but less peak " ..
+	"throughput.")
 
 o = s:option(Value, "shaper_kbit", translate("Downlink rate (kbit/s)"))
 o.datatype = "uinteger"

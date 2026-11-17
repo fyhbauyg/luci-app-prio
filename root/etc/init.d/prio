@@ -34,11 +34,10 @@ START=99
 STOP=10
 # Without this, rc.common rejects `status` and prints its usage text, so every
 # caller (LuCI included) sees the service as dead even while it is running.
-EXTRA_COMMANDS="status reload apply calibrate pickprobe measure"
+EXTRA_COMMANDS="status reload apply pickprobe measure"
 EXTRA_HELP="	status	Show whether the priority engine is running
 	reload	Re-apply the configuration
 	apply <0|1>	Re-apply and wait until the committed switch matches <0|1>
-	calibrate	Sweep the shaping rate during a download and record the latency
 	pickprobe	Trace the route and pick the closest answering hop as probe target"
 
 PRIO_STATE=/var/run/luci-app-prio
@@ -909,7 +908,7 @@ start_detect() {
 		# Nothing ever lowers it automatically. A download from a slow server
 		# is indistinguishable from a slow line from here, so an automatic
 		# downward move would let any limping CDN throttle the whole
-		# connection. "Re-learn" and the calibration are the way down.
+		# connection. "Re-learn" and a fresh measurement are the way down.
 		# NOTE: these are seconds, and now_cs() counts centiseconds, so every
 		# use below multiplies by 100. Getting this wrong made the shaper open
 		# itself every 6 seconds, which is indistinguishable from no shaping.
@@ -1364,32 +1363,7 @@ ifrate() {
 # counts bytes arriving on WAN, which is the *offer*: packets the shaper will
 # drop, retransmissions and other clients are all in it, so it can never prove
 # that a given rate was the bottleneck. This one is read after the queue.
-shaped_kbit() {
-	local lan="$1" secs="${2:-6}" a b
-	a=$(tc -s class show dev "$lan" classid 1:100 2>/dev/null | \
-		sed -n 's/.*Sent \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)
-	case "$a" in ''|*[!0-9]*) echo 0; return 1 ;; esac
-	sleep "$secs"
-	b=$(tc -s class show dev "$lan" classid 1:100 2>/dev/null | \
-		sed -n 's/.*Sent \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)
-	case "$b" in ''|*[!0-9]*) echo 0; return 1 ;; esac
-	[ "$b" -ge "$a" ] || { echo 0; return 1; }
-	# Not $(( (b-a) / 125 / secs )): the counter is cumulative for the life of
-	# the qdisc, so on a fast line it passes 2^31 within minutes and shell
-	# arithmetic would wrap. awk uses doubles and does not care.
-	awk -v a="$a" -v b="$b" -v s="$secs" \
-		'BEGIN { printf "%d\n", (b - a) / 125 / s }'
-}
 
-nudge_rate() {
-	local lan="$1" rate="$2"
-	local burst=$((rate / 8 * 20))
-	[ "$burst" -lt 8192 ] && burst=8192
-	[ "$burst" -gt 256000 ] && burst=256000
-	tc class change dev "$lan" parent 1: classid 1:100 \
-		htb rate "${rate}kbit" ceil "${rate}kbit" \
-		burst "${burst}b" cburst "${burst}b" 2>/dev/null
-}
 
 # The closer the probe target, the cleaner the signal: a hop inside the ISP's
 # own network shows the access link's queue immediately, while a far target
@@ -1631,205 +1605,6 @@ measure() {
 	return 0
 }
 
-calibrate() {
-	local dev lan out
-	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"; [ -n "$dev" ] || dev="$(state_get wan_iface)"
-	lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"; [ -n "$lan" ] || lan="$(state_get lan_iface)"
-	out="$PRIO_STATE/calib.txt"
-	# A probe has to be exclusive. The detector rewrites the same HTB class
-	# every 20 seconds, so without stopping it every sweep step was silently
-	# undone about as often as it was applied.
-	if ! acquire_lock; then
-		: > "$out"
-		printf '另一个设置动作正在运行，请过几秒再试。\n' > "$out"
-		return 1
-	fi
-	# Only now, while holding the lock: a second click racing this one must not
-	# wipe the previous table and suggestion before it discovers it has no lock.
-	rm -f "$PRIO_STATE/calib_suggest"
-	: > "$out"
-	stop_detect
-	local bands
-	bands="$(state_get bands)"
-	case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
-
-	local orig made=0 restore_done=0
-	orig=$(shaper_kbit)
-	# Getting killed halfway through a sweep used to leave the classifier at
-	# whatever step it died on, with the detector already stopped: the line
-	# stayed pinned to a random rate until the next reload.
-	restore_calib() {
-		[ "$restore_done" = 1 ] && return 0
-		restore_done=1
-		stop_detect
-		if [ "$orig" -ge 1000 ]; then
-			printf '%s\n' "$orig" > "$PRIO_STATE/shaper"
-			nudge_rate "$lan" "$(applied_kbit "$orig")"
-		elif [ "$made" = 1 ]; then
-			: > "$PRIO_STATE/shaper"
-			setup_downlink "$lan" "$bands"
-		fi
-		if [ "$(state_get auto_bandwidth)" = "1" ]; then
-			start_detect "$dev" "$lan" "$bands"
-		fi
-	}
-	trap 'restore_calib; release_lock; exit 1' INT TERM HUP
-
-	local i=0 k=0
-	# Ten seconds is enough to tell "no download" from "slow start"; the old
-	# two-minute wait looked like a hung page.
-	printf '正在检查下载流量（最多 10 秒）...\n' >> "$out"
-	while [ "$i" -lt 10 ]; do
-		k=$(ifrate "$dev" 1)
-		[ "$k" -gt 5000 ] && break
-		i=$((i + 1))
-	done
-	if [ "$k" -le 5000 ]; then
-		: > "$out"
-		printf '没检测到下载流量。请先开始一个大文件下载，再运行校准。\n' > "$out"
-		release_lock
-		if [ "$(state_get auto_bandwidth)" = "1" ]; then
-			start_detect "$dev" "$lan" "$bands"
-		fi
-		return 1
-	fi
-
-	# make sure the HTB tree exists at all
-	if ! tc qdisc show dev "$lan" 2>/dev/null | grep -q 'qdisc htb 1: root'; then
-		printf '%s\n' 120000 > "$PRIO_STATE/shaper"
-		setup_downlink "$lan" "$bands"
-		made=1
-	fi
-
-	: > "$out"
-	: > "$PRIO_STATE/calib.raw"
-	printf '校准时间: %s\n下载流量约 %s Mbps\n\n' "$(date)" "$((k / 1000))" >> "$out"
-
-	# Step 1: how much does the line actually deliver with the shaper out of
-	# the way? That number is the ceiling for every later step and the hard
-	# upper bound for the recommendation. The old code swept a fixed
-	# 60..300 Mbit/s list: on a 50 Mbit/s line not one step was limiting, so
-	# every step measured the ISP's buffer and the highest step looked best.
-	local wide; wide=$((k * 3))
-	[ "$wide" -lt 50000 ] && wide=50000
-	nudge_rate "$lan" "$wide"
-	sleep 10
-	local top; top=$(shaped_kbit "$lan" 6)
-	[ "$top" -ge 10000 ] || top=$k
-	# If even the wide-open step cannot deliver what the line was already
-	# doing, the download stopped: everything below would be measured against
-	# an idle link and the "recommendation" would be a throughput figure of
-	# 1 Mbit/s. Refuse to produce numbers at all.
-	if [ "$top" -lt $(( k / 2 )) ]; then
-		: > "$PRIO_STATE/calib.raw"
-		printf '限速放开后实测只有 %s Mbps，而校准时检测到 %s Mbps 的流量，说明下载中途停了。\n' \
-			"$((top / 1000))" "$((k / 1000))" >> "$out"
-		printf '这一轮不作数，请保持下载不中断再校准一次。\n' >> "$out"
-		restore_calib
-		release_lock
-		return 1
-	fi
-	printf '线路能跑: %s Mbps（限速放开时实测）\n\n' "$((top / 1000))" >> "$out"
-	printf '限速(Mbps)  实测(Mbps)  最小/平均/最大 RTT(ms)\n' >> "$out"
-	printf '----------------------------------------------\n' >> "$out"
-
-	# Step 2: walk DOWN from the measured capacity. Going down keeps TCP from
-	# stalling on a sudden drop (300 -> 40 Mbit/s costs a retransmit timeout);
-	# each step gets 10 s to settle and then a 6 s sample, so the number is the
-	# answer to the new rate rather than the tail of the previous one.
-	local p r rtt thr avg aborted=0
-	for p in 100 90 80 70 60; do
-		r=$(( top / 1000 * p / 100 * 1000 ))
-		[ "$r" -ge 1000 ] || continue
-		nudge_rate "$lan" "$r"
-		sleep 10
-		thr=$(shaped_kbit "$lan" 6)
-		rtt=$(ping -c 10 -W 1 "$(state_get rtt_target 2>/dev/null || echo 223.5.5.5)" 2>/dev/null | \
-			tail -1 | sed 's/.*= //')
-		[ -n "$rtt" ] || rtt="-"
-		avg=$(printf '%s' "$rtt" | awk -F'/' '{print int($2)}')
-		case "$avg" in ''|*[!0-9]*) avg=0 ;; esac
-		printf '%7s   %8s   %s\n' "$((r / 1000))" "$((thr / 1000))" "$rtt" >> "$out"
-		if [ "$thr" -le 0 ] || [ "$thr" -lt $(( k / 4 )) ]; then
-			printf '\n这一档只有 %s Mbps（校准时是 %s Mbps），下载已经停了，校准中止。\n' \
-				"$((thr / 1000))" "$((k / 1000))" >> "$out"
-			aborted=1
-			break
-		fi
-		[ "$avg" -gt 0 ] && printf '%s %s %s\n' "$r" "$thr" "$avg" >> "$PRIO_STATE/calib.raw"
-	done
-
-	local restore_done=0
-	# Getting killed halfway through a sweep used to leave the classifier at
-	# whatever step it died on, with the detector already stopped: the line
-	# stayed pinned to a random rate until the next reload.
-	restore_calib() {
-		[ "$restore_done" = 1 ] && return 0
-		restore_done=1
-		stop_detect
-		if [ "$orig" -ge 1000 ]; then
-			printf '%s\n' "$orig" > "$PRIO_STATE/shaper"
-			nudge_rate "$lan" "$(applied_kbit "$orig")"
-		elif [ "$made" = 1 ]; then
-			: > "$PRIO_STATE/shaper"
-			setup_downlink "$lan" "$bands"
-		fi
-		if [ "$(state_get auto_bandwidth)" = "1" ]; then
-			start_detect "$dev" "$lan" "$bands"
-		fi
-	}
-	trap 'restore_calib; release_lock; exit 1' INT TERM HUP
-
-	# Step 3: put the engine back exactly the way it was before we touched it.
-	restore_calib
-
-	if [ "$aborted" = 1 ]; then
-		release_lock
-		return 1
-	fi
-	# Pick the highest rate whose latency is still close to the best seen, and
-	# whose throughput is still near the best -- exactly the "52ms vs 60ms"
-	# judgement, done on the collected numbers. Two guards matter: a step only
-	# carries information when the shaper really was the bottleneck (otherwise
-	# it is the ISP that limited us and the step says nothing), and the answer
-	# can never exceed what the line delivered with the shaper out of the way.
-	awk -v top="$top" -v k="$k" -v out="$PRIO_STATE/calib_suggest" '
-		NF == 3 && $3 > 0 {
-			n++
-			rate[n] = $1; thr[n] = $2; avg[n] = $3
-			if (minavg == 0 || $3 < minavg) minavg = $3
-			if ($2 > bestthr) bestthr = $2
-		}
-		END {
-			if (n == 0 || minavg == 0) exit 1
-			for (i = 1; i <= n; i++) {
-				if (thr[i] < rate[i] * 0.80) continue
-				if (avg[i] > minavg + 10) continue
-				if (rate[i] > rec) { rec = rate[i]; recavg = avg[i] }
-			}
-			if (rec == 0) { rec = int(bestthr * 0.90 / 1000) * 1000; recavg = minavg }
-			cap = top * 0.95
-			if (rec > cap) { rec = int(cap / 1000) * 1000 }
-			# A round in which the download was not there cannot recommend
-			# anything. Without these two guards it happily offered 1 Mbit/s,
-			# and one click on that would have throttled the whole connection.
-			if (bestthr < k * 0.50) exit 1
-			if (rec < 5000) exit 1
-			printf "\n最低延迟 %d ms，最高实测吞吐 %d Mbps\n", minavg, int(bestthr / 1000)
-			printf "建议下行速率: %d kbit/s（该档平均延迟 %d ms）\n", rec, recavg
-			print rec > out
-		}' "$PRIO_STATE/calib.raw" >> "$out"
-
-	if [ ! -s "$PRIO_STATE/calib_suggest" ]; then
-		printf '\n这组数据没能给出建议值（可能每一档都被线路本身限制住了）。\n' >> "$out"
-		printf '换一个能跑满的下载再校准一次。\n' >> "$out"
-		release_lock
-		return 1
-	fi
-	printf '\n完成。上面每一行就是"这个限速下，实际能跑多少、延迟多大"。\n' >> "$out"
-	release_lock
-	return 0
-}
 
 # ---------------- main ----------------
 start() {

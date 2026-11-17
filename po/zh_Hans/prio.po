@@ -437,3 +437,15 @@ msgstr "分开设置上传优先级"
 
 msgid "Off: one priority for both directions, which is what the device table shows. On: every device gets a second column and can be top priority for upload while staying low for download (or the other way round)."
 msgstr "关闭时：上传和下载用同一个优先级，设备列表里只有一列。开启时：每个设备多出一列，可以让它上传最高优先、下载最低（或者反过来）。"
+
+msgid "Give selected devices network priority. The downlink shaper limits the connection below the line's real speed so the router can queue and reorder packets; it measures the line itself, or you type the rate in once and use a fixed rate. Packets are marked before NAT so the classification survives address translation."
+msgstr "给选中的设备网络优先级。下行整形器把连接限在线路真实速度之下，这样队列才会留在路由器上、才有包可重排；它自己会测量线路，你也可以直接填一次固定速率。数据包在 NAT 之前打标记，因此分类结果经过地址转换后依然有效。"
+
+msgid "The shaper watches the round trip to this address: while it stays near the idle baseline the rate is left alone, when it climbs the rate comes down. Pick a stable public address near you; an unreachable one only produces a warning, because the shaper then has nothing to read."
+msgstr "整形器会盯着到这个地址的往返时间：接近空闲基线时不动速率，明显变大时把速率往下调。建议填一个离你近、稳定的公网地址；填了 ping 不通的地址只会让页面报警告，因为那时整形器读不到任何东西。"
+
+msgid "Pick the probe target"
+msgstr "挑选探测目标"
+
+msgid "How far below the measured capacity to run, in percent. Only the measured value is reduced; a rate typed in by hand is used exactly as typed. Bigger means a deeper local queue (priority bites harder) but less peak throughput."
+msgstr "在实测能力之下留多少余量，按百分比。只对测量出来的值打折；手填的速率原样下发。数值越大，路由器里的队列越深、优先级越硬，但峰值带宽越少。"

@@ -181,16 +181,16 @@ if [ "$V6" -gt 0 ]; then ok "IPv6 地址集合已填充"; else sk "IPv6 集合�
 TGT=$(uci -q get prio.main.rtt_target)
 chk "探测目标可 ping 通 ($TGT)" "ping -c 2 -W 2 '$TGT' | grep -q ' 0% packet loss'"
 
-# 8. 校准的失败路径：无流量时必须中止且不留建议
-rm -f $ST/calib_suggest
-/etc/init.d/prio calibrate >/dev/null 2>&1
-RC=$?
-if [ -s $ST/calib_suggest ]; then
-	no "校准在无流量时产生了建议值（应中止）"
+# 8. 实测容量：校准已删除，改成检查测量命令与记录
+chk "measure 命令可用" "/etc/init.d/prio measure 2>&1 | grep -q 'down=\|busy'"
+MD=$(uci -q get prio.main.measured_dl)
+MT=$(uci -q get prio.main.measured_at)
+if [ -n "$MD" ] && [ -n "$MT" ]; then
+	ok "实测容量已记录 (下行 ${MD} kbit，时间戳 ${MT})"
 else
-	ok "校准在不该出数时没有出数 (rc=$RC)"
+	sk "还没有实测记录（线路忙时会跳过测量）"
 fi
-chk "校准中止信息是中文且明确" "grep -q '没检测到下载流量\|作废\|中止' $ST/calib.txt"
+chk "校准已彻底移除" "test \$(grep -c calib /etc/init.d/prio) -eq 0"
 
 # 9. 重新学习
 uci -q delete prio.main.shaper_peak; uci -q delete prio.main.shaper_learned; uci -q commit prio
