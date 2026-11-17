@@ -539,6 +539,12 @@ o.write = function()
 	-- jump straight back to a rate measured on a line that no longer exists.
 	os.remove("/var/run/luci-app-prio/rate_good")
 	os.remove("/var/run/luci-app-prio/up_good")
+	-- The loaded-latency floors are what the controller compares against while
+	-- the shaper is the bottleneck; keeping them makes "forget" a no-op.
+	os.remove("/var/run/luci-app-prio/rttload")
+	os.remove("/var/run/luci-app-prio/rttload_up")
+	os.remove("/var/run/luci-app-prio/rttload_bad")
+	os.remove("/var/run/luci-app-prio/rttload_up_bad")
 	-- The detector keeps its live estimate in tmpfs and start() folds it back
 	-- into the config, so leaving this file makes "forget" a no-op.
 	os.remove("/var/run/luci-app-prio/peak")
@@ -561,7 +567,11 @@ o.validate = function(self, value)
 	-- Keep the uinteger check: overriding validate() replaces the datatype
 	-- one, so "5000.7" would otherwise reach the backend, fail its digit test
 	-- there and be read as 0 = automatic.
-	if not value:match("^%s*%d+%s*$") then
+	-- Trim first: the backend treats any non-digit as "automatic", so a pasted
+	-- "5000 " would silently turn shaping off while the page still said
+	-- automatic.
+	value = value:match("^%s*(.-)%s*$") or value
+	if not value:match("^%d+$") then
 		return nil, translate("Enter a whole number in kbit/s, or 0 for automatic.")
 	end
 	local n = tonumber(value)
@@ -579,11 +589,17 @@ o.description = translate("0 means automatic: the upload stays open until it has
 
 o = s:option(DummyValue, "_upshaper", translate("Uplink shaper"))
 o.cfgvalue = function()
-	local c = ""
-	if fs.access("/var/run/luci-app-prio/status") then
-		c = fs.readfile("/var/run/luci-app-prio/status") or ""
+	-- Its own file: the controller rewrites the uplink rate on every change,
+	-- and doing that by rewriting the shared status file raced with the other
+	-- writers (a lost update could throw away "started"). Fall back to the old
+	-- status line for an install upgraded from an older build.
+	local v = nil
+	if fs.access("/var/run/luci-app-prio/upshaper") then
+		v = (fs.readfile("/var/run/luci-app-prio/upshaper") or ""):match("^([^\n]+)")
 	end
-	local v = c:match("upshaper:([^\n]+)")
+	if not v and fs.access("/var/run/luci-app-prio/status") then
+		v = (fs.readfile("/var/run/luci-app-prio/status") or ""):match("upshaper:([^\n]+)")
+	end
 	if not v then
 		return translate("not reported yet")
 	end

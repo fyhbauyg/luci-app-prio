@@ -69,7 +69,7 @@ echo "      等待一个空闲窗口以学习延迟基线..."
 sleep 25
 chk "延迟基线已学到 (rtt_base)" "[ -s $ST/rtt_base ]"
 # up_rate 由 start() 用 : > 创建，"文件存在"永远成立 —— 必须比内容与 tc
-chk "上行整形状态行已上报" "grep -q '^upshaper:' $ST/status"
+chk "上行整形状态已上报" "test -s $ST/upshaper"
 if [ -s $ST/up_rate ]; then
 	UR=$(cat $ST/up_rate); case "$UR" in ''|*[!0-9]*) UR=0 ;; esac
 	UPR=$(rate_kbit $WAN); case "$UPR" in ''|*[!0-9]*) UPR=0 ;; esac
@@ -91,11 +91,15 @@ UPL0=$(uci -q get prio.main.uplink_learned)
 UR0=$(cat $ST/up_rate 2>/dev/null)
 UC0=$(cat $ST/up_cfg 2>/dev/null)
 restore_up() {
-	[ -n "$UPL0" ] && uci -q set prio.main.uplink_learned=$UPL0 || uci -q delete prio.main.uplink_learned
 	uci -q set prio.main.uplink_kbit=${UPK0:-0}
-	uci -q commit prio
 	if [ -n "$UR0" ]; then printf '%s\n' "$UR0" > $ST/up_rate; else rm -f $ST/up_rate; fi
 	if [ -n "$UC0" ]; then printf '%s\n' "$UC0" > $ST/up_cfg; else rm -f $ST/up_cfg; fi
+	if [ -n "$UPL0" ]; then uci -q set prio.main.uplink_learned=$UPL0; else uci -q delete prio.main.uplink_learned; fi
+	uci -q commit prio
+}
+restore_key() {
+	if [ -n "$UPL0" ]; then uci -q set prio.main.uplink_learned=$UPL0; else uci -q delete prio.main.uplink_learned; fi
+	uci -q commit prio
 }
 trap 'restore_up' EXIT INT TERM
 
@@ -110,7 +114,7 @@ if [ "$PERS" -ge 10000 ] && [ "$PERS" -le 15000 ]; then
 else
 	no "上行学习值没有持久化 (期望 ~12345，实际 ${PERS} kbit)"
 fi
-chk "上行状态行是具体数值而不是 auto" "grep -qE '^upshaper:[0-9]+kbit' $ST/status"
+chk "上行状态是具体数值而不是 auto" "grep -qE '^[0-9]+kbit' $ST/upshaper"
 
 uci -q set prio.main.uplink_kbit=5000
 uci -q commit prio
@@ -121,7 +125,9 @@ if [ "$MAN" -ge 4000 ] && [ "$MAN" -le 6000 ]; then
 else
 	no "手动值被学习值覆盖 (期望 ~5000，实际 ${MAN} kbit)"
 fi
-# 手动值必须钉住：等两个窗口，闭环不能把它改走
+# 手动值必须钉住：等两个窗口，闭环不能把它改走。
+# 注意：没有上行流量时闭环整段被 thr_up>1500 挡在外面，这条会空跑通过，
+# 只有在有人上传的时候才真正验证到 B2。
 sleep 45
 MAN2=$(rate_kbit $WAN); case "$MAN2" in ''|*[!0-9]*) MAN2=0 ;; esac
 if [ "$MAN2" -ge 4500 ] && [ "$MAN2" -le 5500 ]; then
@@ -133,6 +139,9 @@ fi
 restore_up
 trap - EXIT INT TERM
 /etc/init.d/prio reload >/dev/null 2>&1; sleep 3
+# start() folds the live tmpfs rate back into uplink_learned; put the saved
+# value back so a selftest run does not rewrite what the router had learned.
+restore_key
 
 # 5c. 静态检查：这些是"代码里确实有这段逻辑"的存在性检查，不是行为断言。
 # 行为层面能自动验证的只有上面 B1/B2 两条；B3/B4 需要真实的上传/下载流量，
@@ -141,7 +150,7 @@ chk "上行有 upmiss 保护代码" "grep -q 'upmiss=' /etc/init.d/prio"
 chk "上行种子拒绝已堆积的窗口 (sclean)" "grep -q 'sclean' /etc/init.d/prio"
 chk "上行种子取中间值 (sed -n 2p)" "grep -q 'sed -n 2p' /etc/init.d/prio"
 chk "种子采样要求 4/4 全应答 (rtt_all_ms)" "grep -q 'rtt_all_ms' /etc/init.d/prio"
-chk "上行状态行有多处写入点 (apply 与 setup)" "[ \$(grep -c 'upshaper:' /etc/init.d/prio) -ge 3 ]"
+chk "上行状态由 setup 与 apply 两处写入" "[ \$(grep -c 'PRIO_STATE/upshaper' /etc/init.d/prio) -ge 3 ]"
 
 
 # 6. 分类规则
