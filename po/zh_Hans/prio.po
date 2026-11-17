@@ -385,7 +385,7 @@ msgid "Auto-learn downlink bandwidth (experimental)"
 msgstr "自动学习下行带宽（实验性）"
 
 msgid "While there is traffic the shaper watches the round trip to the probe target: near the idle baseline it raises the limit a little, blown up it lowers it. That keeps the queue on this router, which is what priority needs. It needs a probe target that answers ping and an idle window for the baseline, and it cannot tell our own queue from the modem's, so it only ever finds the line's capacity approximately. Measured fixed rates are steadier: run a speedtest and enter about 85% of what it reports."
-msgstr "有流量时会盯着到探测目标的往返时间：接近空闲基线就略微上调限速，明显变大就下调。这样队列才会留在本路由器上，优先级才有东西可排。前提是探测目标能 ping 通、并且偶尔有线路空闲的时刻来测基线；它也分不清"排队在我们自己这里"和"排队在模组里"，所以只能大致逼近线路容量。实测后填固定速率会更稳：跑一次测速，填它报的 85% 左右。"
+msgstr "有流量时会盯着到探测目标的往返时间：接近空闲基线就略微上调限速，明显变大就下调。这样队列才会留在本路由器上，优先级才有东西可排。前提是探测目标能 ping 通、并且偶尔有线路空闲的时刻来测基线；它也分不清“排队在我们自己这里”和“排队在模组里”，所以只能大致逼近线路容量。实测后填固定速率会更稳：跑一次测速，填它报的 85% 左右。"
 
 msgid "Priority Band (download)"
 msgstr "优先级带（下载）"
@@ -403,7 +403,7 @@ msgid "Measure the line automatically"
 msgstr "自动测量线路容量"
 
 msgid "Capacity is measured, not guessed: the router downloads and uploads through its own unshaped path for a few seconds (on start and every half hour), and the shaper runs at that value minus the safety margin. The latency loop may only LOWER the rate afterwards, never raise it, because a round trip tells you that there is a queue but never how many bits fit."
-msgstr "容量是测出来的，不是猜的：路由器用自己的免整形通道下载、上传几秒钟（启动时一次，之后每半小时一次），限速就设在这个值减去安全余量上。之后延迟环路只能把速率往下调，永远不会往上调 —— 往返时间只能告诉你"有队列"，永远告诉不了你"能装多少比特"。"
+msgstr "容量是测出来的，不是猜的：路由器用自己的免整形通道下载、上传几秒钟（启动时一次，之后每半小时一次），限速就设在这个值减去安全余量上。之后延迟环路只能把速率往下调，永远不会往上调 —— 往返时间只能告诉你“有队列”，永远告诉不了你“能装多少比特”。"
 
 msgid "Measured capacity"
 msgstr "实测容量"
@@ -457,7 +457,7 @@ msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/S
 msgstr "使用固件自带的测速客户端：自动挑选大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的速度。会消耗真实流量 —— 快线上大约 300 MB。"
 
 msgid "Capacity is measured, not guessed: the router downloads and uploads through its own unshaped path (using the built-in speedtest on a mainland node) and the shaper runs at that value minus the safety margin. The latency loop may only LOWER the rate afterwards, never raise it, because a round trip tells you that there is a queue but never how many bits fit."
-msgstr "容量是测出来的，不是猜的：路由器用自己的免整形通道（固件自带的测速客户端、大陆节点）实测一次，限速就设在这个值减去安全余量上。之后延迟环路只能把速率往下调，永远不会往上调 —— 往返时间只能告诉你"有队列"，永远告诉不了你"能装多少比特"。"
+msgstr "容量是测出来的，不是猜的：路由器用自己的免整形通道（固件自带的测速客户端、大陆节点）实测一次，限速就设在这个值减去安全余量上。之后延迟环路只能把速率往下调，永远不会往上调 —— 往返时间只能告诉你“有队列”，永远告诉不了你“能装多少比特”。"
 
 msgid "Last measurement"
 msgstr "最近一次测量"
