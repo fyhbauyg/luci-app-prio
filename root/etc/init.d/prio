@@ -65,7 +65,74 @@ state_set() { uci -q set "prio.main.$1=$2" && uci -q commit prio; }
 PRIO_DIAG=/root/prio-diag.log
 PRIO_DIAG_MAX=131072
 
+# Old lines are dropped by timestamp, once a day, so "keep 7 days" means seven
+# days of lines and not "the last 128 kB". Runs even when logging is switched
+# off: turning the log off must not freeze the old lines on the flash.
+diag_prune_file() {
+	local f="$1" days="$2" now cut
+	[ -s "$f" ] || return 0
+	now=$(date +%s)
+	cut="$(date -d "@$(( now - days * 86400 ))" +%F 2>/dev/null)"
+	[ -n "$cut" ] || return 0
+	if awk -v c="$cut" 'length($0) >= 10 && substr($0, 1, 10) >= c { print }' \
+		"$f" > "$f.tmp" 2>/dev/null; then
+		mv -f "$f.tmp" "$f" 2>/dev/null || { rm -f "$f.tmp"; return 1; }
+		return 0
+	fi
+	rm -f "$f.tmp"
+	return 1
+}
+
+diag_prune() {
+	local days
+	days="$(state_get diag_days)"
+	case "$days" in ''|*[!0-9]*) days=7 ;; esac
+	[ "$days" -ge 1 ] || return 0
+	[ "$days" -gt 3650 ] && days=3650
+	# The rotated copy as well: otherwise up to 128 kB of arbitrarily old lines
+	# survives forever, which is exactly what "keep 7 days" is meant to stop.
+	local rc=0
+	diag_prune_file "$PRIO_DIAG" "$days" || rc=1
+	diag_prune_file "$PRIO_DIAG.1" "$days" || rc=1
+	return $rc
+}
+
+# Once a day, and callable from anywhere: the log must age out even when the
+# engine is stopped or nothing happens for days, so start()/stop() call this
+# too instead of relying on diag() being reached by an event.
+diag_maybe_prune() {
+	local last fail now
+	now=$(date +%s)
+	last=$(cat "$PRIO_STATE/diag_prune" 2>/dev/null)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	fail=$(cat "$PRIO_STATE/diag_prune_fail" 2>/dev/null)
+	case "$fail" in ''|*[!0-9]*) fail=0 ;; esac
+
+	if [ $(( now - last )) -ge 86400 ]; then
+		if diag_prune; then
+			printf '%s\n' "$now" > "$PRIO_STATE/diag_prune" 2>/dev/null
+			: > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
+		else
+			printf '%s\n' "$now" > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
+		fi
+		return 0
+	fi
+	# Inside the day: retry ONLY after a failure, and at most every ten
+	# minutes. The loop calls this about twice a minute, and a permanently
+	# broken prune must not run on every one of those windows.
+	[ "$fail" -gt 0 ] || return 0
+	[ $(( now - fail )) -ge 600 ] || return 0
+	if diag_prune; then
+		printf '%s\n' "$now" > "$PRIO_STATE/diag_prune" 2>/dev/null
+		: > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
+	fi
+}
+
 diag() {
+	# Prune before the on/off check: switching the log off must not freeze the
+	# lines that are already there.
+	diag_maybe_prune
+	[ "$(state_get diag)" = "0" ] && return 0
 	printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$PRIO_DIAG" 2>/dev/null || return 0
 	local sz
 	sz=$(wc -c < "$PRIO_DIAG" 2>/dev/null)
@@ -1073,6 +1140,8 @@ start_detect() {
 			# exactly the case worth recording. Only values that exist at this
 			# point are logged -- rate, latency and queue state come later in
 			# the window and would print stale or empty.
+			# Cheap daily check, so an idle line still ages its log out.
+			diag_maybe_prune
 			snap=$(( ${snap:-0} + 1 ))
 			if [ "$snap" -ge 10 ]; then
 				snap=0
@@ -2036,6 +2105,7 @@ start() {
 	printf '%s\n' "$lan" > "$PRIO_STATE/lan"
 	echo "started" >> "$PRIO_STATE/status"
 	logger -t luci-app-prio "priority engine started (bands=$bands wan=$dev lan=$lan)"
+	diag_maybe_prune
 	diag "engine started bands=${bands} wan=${dev} lan=${lan} fq_codel=$(state_get fq_codel) margin=$(margin_pct) default_band=$(state_get default_band) up_kbit=$(state_get uplink_kbit)"
 	release_lock
 }
@@ -2091,6 +2161,7 @@ stop() {
 	fi
 	: > "$PRIO_STATE/status" 2>/dev/null
 	logger -t luci-app-prio "priority engine stopped"
+	diag_maybe_prune
 	diag "engine stopped"
 }
 
@@ -2154,6 +2225,9 @@ status() {
 # an interrupted run leaves turboacc pinned to flow_offloading forever.
 boot() {
 	config_load prio
+	# The log ages out even while the plugin is switched off; boot is the one
+	# point guaranteed to run in that state.
+	diag_maybe_prune
 	if [ "$(state_get enabled)" != "1" ]; then
 		local saved
 		saved="$(state_get saved_fastpath)"

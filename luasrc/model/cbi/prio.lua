@@ -455,7 +455,12 @@ o = s:option(DummyValue, "_diag", translate("Diagnostic log (last lines)"))
 o.rawhtml = true
 o.cfgvalue = function()
 	local f = "/root/prio-diag.log"
+	local okv, off = pcall(function() return uci:get("prio", "main", "diag") end)
+	local disabled = okv and off == "0"
 	if not fs.access(f) then
+		if disabled then
+			return "<em>" .. translate("logging is switched off") .. "</em>"
+		end
 		return "<em>" .. translate("nothing logged yet") .. "</em>"
 	end
 	local txt = fs.readfile(f) or ""
@@ -466,13 +471,31 @@ o.cfgvalue = function()
 	for i = from, #lines do
 		out[#out + 1] = (lines[i]:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
 	end
-	return "<pre style=\"margin:0;font-size:11px;line-height:1.35;white-space:pre-wrap\">" ..
+	local head = disabled and ("<em>" .. translate("logging is switched off") .. "</em>") or ""
+	return head .. "<pre style=\"margin:0;font-size:11px;line-height:1.35;white-space:pre-wrap\">" ..
 		table.concat(out, "\n") .. "</pre>"
 end
 o.description = translate("Rate changes, measurement results and a snapshot of every " ..
 	"band (bytes and drops) every few minutes, kept across reboots in " ..
 	"/root/prio-diag.log (rotated at 128 kB). A band that is starved while the one " ..
 	"above it is busy looks different from a line that is simply slow.")
+
+o = s:option(Flag, "diag", translate("Write the diagnostic log"))
+o.default = 1
+o.rmempty = false
+o.description = translate("Rate changes, measurements and a per-band snapshot every few " ..
+	"minutes, kept in /root/prio-diag.log. Switching it off stops new lines; both the file " ..
+	"and the rotated copy .1 are still pruned by age.")
+
+o = s:option(ListValue, "diag_days", translate("Keep the log for"))
+o.default = "7"
+o.rmempty = false
+o:value("3", translatef("%d days", 3))
+o:value("7", translatef("%d days", 7))
+o:value("14", translatef("%d days", 14))
+o:value("0", translate("until the 128 kB cap (no age pruning)"))
+o.description = translate("Lines older than this are dropped once a day, and the file is " ..
+	"rotated at 128 kB either way. Set 0 to keep everything the size cap allows.")
 
 o = s:option(Button, "_measure", translate("Measured capacity"))
 o.inputtitle = translate("Measure now (up to a minute on a slow line)")

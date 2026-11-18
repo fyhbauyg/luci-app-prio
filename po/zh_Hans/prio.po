@@ -405,3 +405,24 @@ msgstr "还没有记录"
 
 msgid "Rate changes, measurement results and a snapshot of every band (bytes and drops) every few minutes, kept across reboots in /root/prio-diag.log (rotated at 128 kB). A band that is starved while the one above it is busy looks different from a line that is simply slow."
 msgstr "记录速率变化、测量结果，以及每隔几分钟对每条带做一次快照（字节数与丢包数），保存在 /root/prio-diag.log（超过 128 kB 自动轮转），重启后仍在。这样「上面那条带在忙时下面这条带被饿死」和「整条线就是慢」就能区分开。"
+
+msgid "Write the diagnostic log"
+msgstr "写入诊断日志"
+
+msgid "Keep the log for"
+msgstr "日志保留天数"
+
+msgid "%d days"
+msgstr "%d 天"
+
+msgid "until the 128 kB cap (no age pruning)"
+msgstr "到 128 kB 上限为止（不按天数清理）"
+
+msgid "Lines older than this are dropped once a day, and the file is rotated at 128 kB either way. Set 0 to keep everything the size cap allows."
+msgstr "超过这个天数的行每天清理一次；无论怎么设，文件到 128 kB 都会轮转。设 0 表示只受大小限制。"
+
+msgid "logging is switched off"
+msgstr "日志已关闭"
+
+msgid "Rate changes, measurements and a per-band snapshot every few minutes, kept in /root/prio-diag.log. Switching it off stops new lines; both the file and the rotated copy .1 are still pruned by age."
+msgstr "记录速率变化、测量结果，以及每隔几分钟对每条带做一次快照，保存在 /root/prio-diag.log。关掉之后不再写入新行；原有文件连同轮转出的 .1 都会按保留天数清理。"
