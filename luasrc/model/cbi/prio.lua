@@ -447,6 +447,33 @@ if refresh_now then
 	end
 end
 
+-- The engine keeps a bounded, persistent log (/root/prio-diag.log) because the
+-- failures worth debugging -- one band starved for hours, a rate pinned at the
+-- floor overnight -- are invisible minutes later, and the syslog ring buffer
+-- holds minutes. Anything it cannot do from the UI the user can read over ssh.
+o = s:option(DummyValue, "_diag", translate("Diagnostic log (last lines)"))
+o.rawhtml = true
+o.cfgvalue = function()
+	local f = "/root/prio-diag.log"
+	if not fs.access(f) then
+		return "<em>" .. translate("nothing logged yet") .. "</em>"
+	end
+	local txt = fs.readfile(f) or ""
+	local lines = {}
+	for l in txt:gmatch("[^\n]+") do lines[#lines + 1] = l end
+	local from = math.max(1, #lines - 24)
+	local out = {}
+	for i = from, #lines do
+		out[#out + 1] = (lines[i]:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	end
+	return "<pre style=\"margin:0;font-size:11px;line-height:1.35;white-space:pre-wrap\">" ..
+		table.concat(out, "\n") .. "</pre>"
+end
+o.description = translate("Rate changes, measurement results and a snapshot of every " ..
+	"band (bytes and drops) every few minutes, kept across reboots in " ..
+	"/root/prio-diag.log (rotated at 128 kB). A band that is starved while the one " ..
+	"above it is busy looks different from a line that is simply slow.")
+
 o = s:option(Button, "_measure", translate("Measured capacity"))
 o.inputtitle = translate("Measure now (up to a minute on a slow line)")
 o.inputstyle = "reload"

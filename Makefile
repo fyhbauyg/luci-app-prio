@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prio
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=101
+PKG_RELEASE:=102
 
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=congge

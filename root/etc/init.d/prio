@@ -57,6 +57,41 @@ state_set() { uci -q set "prio.main.$1=$2" && uci -q commit prio; }
 # run held the lock, the speedtest client answered nothing. Silently leaving the
 # old numbers in place makes the button look dead, so the reason is recorded
 # here and the page reports it next to the last measurement.
+# ---- persistent diagnostics ------------------------------------------------
+# /root, not /var/run: the interesting failures (a band starved for hours, a
+# rate pinned at the floor overnight) are only obvious long after the fact,
+# and tmpfs is gone by then. Writes happen on events and once every few
+# minutes, so the flash cost is negligible; the file is capped and rotated.
+PRIO_DIAG=/root/prio-diag.log
+PRIO_DIAG_MAX=131072
+
+diag() {
+	printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$PRIO_DIAG" 2>/dev/null || return 0
+	local sz
+	sz=$(wc -c < "$PRIO_DIAG" 2>/dev/null)
+	case "$sz" in ''|*[!0-9]*) return 0 ;; esac
+	if [ "$sz" -gt "$PRIO_DIAG_MAX" ]; then
+		# If the rename fails the file would grow without bound, so fall back
+		# to truncating it: losing history beats filling the overlay.
+		mv -f "$PRIO_DIAG" "$PRIO_DIAG.1" 2>/dev/null || : > "$PRIO_DIAG"
+	fi
+}
+
+# One line per band: bytes and drops, so a starving band can be told apart
+# from a starving line. Uses tc's own counters -- no extra traffic.
+diag_bands() {
+	local dev="${1:-br-lan}" b out
+	out=""
+	for b in 2:1 2:2 2:3; do
+		# "Sent <bytes> bytes <pkts> pkt (dropped <n>, overlimits <n> ...":
+		# field 2 is the byte count, field 7 the drop count.
+		out="$out $(tc -s class show dev "$dev" 2>/dev/null |
+			awk -v c="class ets $b" -v lab="$b" '$0 ~ c {f=1; next} f && /Sent/ {
+				printf "%s=%dMB/%dd", lab, int($2/1048576), $7; exit }' 2>/dev/null)"
+	done
+	echo "$out"
+}
+
 mea_fail() {
 	mkdir -p "$PRIO_STATE" 2>/dev/null
 	printf '%s %s\n' "${MEASURE_NOW:-$(date +%s)}" "$1" > "$PRIO_STATE/measure_err" 2>/dev/null
@@ -1033,6 +1068,16 @@ start_detect() {
 			fi
 			thr=$(( win_bytes * 8 * 100 / win_cs / 1000 ))
 			thr_up=$(( win_txb * 8 * 100 / win_cs / 1000 ))
+			# Snapshot every ~10 windows (a few minutes) BEFORE any of the
+			# branches below can skip the rest of the window: an idle line is
+			# exactly the case worth recording. Only values that exist at this
+			# point are logged -- rate, latency and queue state come later in
+			# the window and would print stale or empty.
+			snap=$(( ${snap:-0} + 1 ))
+			if [ "$snap" -ge 10 ]; then
+				snap=0
+				diag "snap rate=$(shaper_kbit) thr=${thr} thr_up=${thr_up} base=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null) q=$(cat "$PRIO_STATE/queue" 2>/dev/null) bands:$(diag_bands "$lan")"
+			fi
 			win_bytes=0; win_txb=0; win_cs=0
 			# A measurement of our own was running through this window. Its
 			# bytes are not line throughput, and treating them as such would
@@ -1254,6 +1299,7 @@ start_detect() {
 						if apply_uplink_rate "$dev" "$newup"; then
 							set_up_rate "$newup"
 							logger -t luci-app-prio "uplink ${up} -> ${newup}kbit (rtt ${urtt}ms, idle ${base}ms)"
+							diag "cut-up uplink ${up} -> ${newup} thr_up=${thr_up} rtt=${urtt} base=${base} floor=${ufloor}"
 						fi
 					fi
 				fi
@@ -1319,6 +1365,7 @@ start_detect() {
 					if apply_downlink_rate "$lan" "$bands" "$newrate"; then
 						printf '%s\n' "$newrate" > "$PRIO_STATE/shaper"
 						logger -t luci-app-prio "rate ${rate} -> ${newrate}kbit (probe unanswered at the cap)"
+					diag "cut(probe) rate ${rate} -> ${newrate} thr=${thr} rtt=${rtt} base=${base} bands:$(diag_bands "$lan")"
 					fi
 				fi
 				continue
@@ -1382,6 +1429,7 @@ start_detect() {
 					printf '%s\n' "$newrate" > "$PRIO_STATE/peak"
 					peak=$newrate
 					logger -t luci-app-prio "rate ${rate} -> ${newrate}kbit (rtt ${rtt}ms, idle ${base}ms)"
+					diag "cut rate ${rate} -> ${newrate} thr=${thr} rtt=${rtt} base=${base} floor=${mfloor} bands:$(diag_bands "$lan")"
 				fi
 			fi
 
@@ -1676,6 +1724,7 @@ measure() {
 	[ "$ul" -ge 1000 ] && ulok=1
 	if [ "$dlok" = 0 ] && [ "$ulok" = 0 ]; then
 		logger -t luci-app-prio "measurement failed (down ${dl} up ${ul} kbit)"
+		diag "measure failed dl=${dl} ul=${ul} method=${method:-?}"
 		mea_fail no-data
 		return 1
 	fi
@@ -1697,6 +1746,7 @@ measure() {
 		[ "$guard_reject" = 1 ] || [ "$guard_reject_up" = 1 ] || mea_ok
 		return 0
 	}
+	diag "measure stored dl=${dl} ul=${ul} force=${force:-no}"
 	state_set measured_dl "$dl"
 	state_set measured_ul "$ul"
 	# A stored number clears the previous failure note; a rejected one keeps it,
@@ -1986,6 +2036,7 @@ start() {
 	printf '%s\n' "$lan" > "$PRIO_STATE/lan"
 	echo "started" >> "$PRIO_STATE/status"
 	logger -t luci-app-prio "priority engine started (bands=$bands wan=$dev lan=$lan)"
+	diag "engine started bands=${bands} wan=${dev} lan=${lan} fq_codel=$(state_get fq_codel) margin=$(margin_pct) default_band=$(state_get default_band) up_kbit=$(state_get uplink_kbit)"
 	release_lock
 }
 
@@ -2040,6 +2091,7 @@ stop() {
 	fi
 	: > "$PRIO_STATE/status" 2>/dev/null
 	logger -t luci-app-prio "priority engine stopped"
+	diag "engine stopped"
 }
 
 reload() {

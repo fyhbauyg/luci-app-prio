@@ -396,3 +396,12 @@ msgstr "勾选：fq_codel 按流分开排队、目标延迟 3ms，所以一条�
 
 msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. Clicking returns immediately; the test itself runs in the background, so reload this page in a minute to see the result. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. Automatic re-measurements ignore a result under half of the previous one within a day (when that one was at least 5 Mbit/s), so a throttled test cannot pin the line; pressing this button overrides that check, because you have just looked at the connection."
 msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。点一下立刻返回，测速在后台进行，过一分钟刷新本页就能看到结果。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。自动重测会忽略「比上次低一半以上」的结果（上一次至少 5 Mbit/s 时），避免一次被限速的测速把速率钉死；而手动点这个按钮会绕过该检查——因为你刚刚亲自看过连接状态。"
+
+msgid "Diagnostic log (last lines)"
+msgstr "诊断日志（最后几行）"
+
+msgid "nothing logged yet"
+msgstr "还没有记录"
+
+msgid "Rate changes, measurement results and a snapshot of every band (bytes and drops) every few minutes, kept across reboots in /root/prio-diag.log (rotated at 128 kB). A band that is starved while the one above it is busy looks different from a line that is simply slow."
+msgstr "记录速率变化、测量结果，以及每隔几分钟对每条带做一次快照（字节数与丢包数），保存在 /root/prio-diag.log（超过 128 kB 自动轮转），重启后仍在。这样「上面那条带在忙时下面这条带被饿死」和「整条线就是慢」就能区分开。"
