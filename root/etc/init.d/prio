@@ -102,6 +102,7 @@ diag_prune() {
 # too instead of relying on diag() being reached by an event.
 diag_maybe_prune() {
 	local last fail now attempt
+	mkdir -p "$PRIO_STATE" 2>/dev/null
 	now=$(date +%s)
 	last=$(cat "$PRIO_STATE/diag_prune" 2>/dev/null)
 	case "$last" in ''|*[!0-9]*) last=0 ;; esac
@@ -2106,6 +2107,25 @@ start() {
 		tc qdisc del dev "$lan" root 2>/dev/null
 	fi
 
+	# Everything above reports failures by writing into $PRIO_STATE/status and
+	# returning non-zero, and those returns used to be ignored: start printed
+	# "started" and returned 0 even when the qdisc was never installed, so the
+	# boot retry below could not notice. Check the result instead of assuming it.
+	local ok=1
+	[ "$downlink" = 1 ] && { qdisc_is_ours "$lan" || ok=0; }
+	if [ "$downlink" = 1 ] && grep -q 'downlink:fail' "$PRIO_STATE/status" 2>/dev/null; then
+		ok=0
+	fi
+	if [ "$uplink" = 1 ] && grep -q 'uplink:fail' "$PRIO_STATE/status" 2>/dev/null; then
+		ok=0
+	fi
+	if [ "$ok" = 0 ]; then
+		logger -t luci-app-prio "start failed: the queue was not installed (wan=$dev lan=$lan)"
+		diag "start failed wan=${dev} lan=${lan} status=$(tr '\n' ',' < "$PRIO_STATE/status" 2>/dev/null)"
+		release_lock
+		return 1
+	fi
+
 	printf '%s\n' "$dev" > "$PRIO_STATE/dev"
 	printf '%s\n' "$lan" > "$PRIO_STATE/lan"
 	echo "started" >> "$PRIO_STATE/status"
@@ -2246,5 +2266,27 @@ boot() {
 		fi
 		return 0
 	fi
-	start
+
+	# The 4G/5G interface takes tens of seconds to appear after a reboot. Starting
+	# before it exists left the router UNSHAPED -- no queue, no priority -- until
+	# someone noticed, which is exactly what happened twice on 2026-11-18. Wait
+	# for the device and retry the start instead.
+	# Detached: rcS runs boot() synchronously, and a 4G modem can take minutes
+	# to appear. Waiting here would hold up the rest of the boot for nothing.
+	local dev
+	config_get dev main wan_iface eth2
+	(
+		i=0
+		while [ "$i" -lt 30 ]; do
+			[ -e "/sys/class/net/$dev" ] && start && {
+				[ "$i" -gt 0 ] && logger -t luci-app-prio "boot: shaper up after ${i} retries"
+				exit 0
+			}
+			i=$((i + 1))
+			sleep 10
+		done
+		logger -t luci-app-prio "boot: the shaper is NOT active (gave up after 5 minutes)"
+		diag "boot: start failed after retries"
+	) </dev/null >/dev/null 2>&1 &
+	return 0
 }
