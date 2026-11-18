@@ -28,7 +28,23 @@ import sys
 BASE = 14            # idle baseline, ms (measured on the real line)
 JITTER = [34, 54, 74, 94, 64, 44]
 MARGIN = 10          # percent, shaper_margin
-FLOOR = 2000         # kbit/s
+FLOOR_MIN = 2000     # kbit/s, absolute minimum
+FLOOR_PCT = 15       # of the last MEASURED capacity, see r101
+MEASURED = 375727    # kbit/s, the value the floor is derived from in these runs
+
+
+def floor_of(measured=None):
+    """The latency loop may not cut below this (r101).
+
+    It used to be a flat 2 Mbit, which let one long congested night walk a
+    267 Mbit line down to 2 Mbit and keep it there: a reload keeps the tmpfs
+    estimate and the 50% guard then blocked the recovery measurement.
+    """
+    # measured=None rather than measured=MEASURED: a default argument is bound
+    # once at import time and would ignore the per-scenario assignment.
+    if measured is None:
+        measured = MEASURED
+    return max(measured * FLOOR_PCT // 100, FLOOR_MIN)
 
 
 def applied_of(estimate, margin=MARGIN):
@@ -54,17 +70,21 @@ def step(estimate, capacity, demand, jitter_index):
     if rtt == 0:
         # no answer at all: a dead target or a modem queued past the timeout
         if bind:
-            return max(estimate * 90 // 100, FLOOR), "cut(probe)"
+            return max(estimate * 90 // 100, floor_of()), "cut(probe)"
         return estimate, "hold(probe)"
     if rtt > BASE + 300:
         excess = rtt - BASE
         pct = 10 + (excess - 300) // 40
         pct = max(10, min(30, pct))
-        return max(estimate * (100 - pct) // 100, FLOOR), "cut(%d%%)" % pct
+        return max(estimate * (100 - pct) // 100, floor_of()), "cut(%d%%)" % pct
     return estimate, "hold"
 
 
 def run(name, capacity, demand, seed_estimate, windows=40, change_at=None, change_to=None):
+    # In the firmware the floor is derived from prio.main.measured_dl, i.e. the
+    # last successful measurement. In these scenarios that is the seed.
+    global MEASURED
+    MEASURED = seed_estimate
     est = seed_estimate
     trail = []
     for w in range(windows):

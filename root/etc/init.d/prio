@@ -1069,6 +1069,22 @@ start_detect() {
 			fi
 			now=$(now_cs)
 
+			# A latency-only cut may not sink the line to an unusable rate.
+			# The floor used to be a flat 2 Mbit, so one long congested night
+			# (or a probe target that answers slowly) could walk a 267 Mbit
+			# line down to 2 Mbit and leave every band there: a reload keeps
+			# the tmpfs estimate, and the 50% guard then blocked every fresh
+			# measurement, so only a power cycle brought it back. 15% of what
+			# the line last measured bounds the damage.
+			mfl="$(state_get measured_dl)"
+			case "$mfl" in ''|*[!0-9]*) mfl=0 ;; esac
+			mfloor=$(( mfl * 15 / 100 ))
+			[ "$mfloor" -lt 2000 ] && mfloor=2000
+			mul="$(state_get measured_ul)"
+			case "$mul" in ''|*[!0-9]*) mul=0 ;; esac
+			ufloor=$(( mul * 15 / 100 ))
+			[ "$ufloor" -lt 2000 ] && ufloor=2000
+
 			over=$(htb_overlimits "$lan")
 			case "$over" in ''|*[!0-9]*) over=0 ;; esac
 			queued=0
@@ -1233,7 +1249,7 @@ start_detect() {
 						# no automatic raise here either: measure() seeds the
 						# uplink, latency only cuts it
 					fi
-					[ "$newup" -lt 2000 ] && newup=2000
+					[ "$newup" -lt "$ufloor" ] && newup=$ufloor
 					if [ "$newup" -ne "$up" ]; then
 						if apply_uplink_rate "$dev" "$newup"; then
 							set_up_rate "$newup"
@@ -1299,7 +1315,7 @@ start_detect() {
 				fi
 				if [ "$bind" = 1 ]; then
 					newrate=$(( rate * 90 / 100 ))
-					[ "$newrate" -lt 2000 ] && newrate=2000
+					[ "$newrate" -lt "$mfloor" ] && newrate=$mfloor
 					if apply_downlink_rate "$lan" "$bands" "$newrate"; then
 						printf '%s\n' "$newrate" > "$PRIO_STATE/shaper"
 						logger -t luci-app-prio "rate ${rate} -> ${newrate}kbit (probe unanswered at the cap)"
@@ -1359,7 +1375,7 @@ start_detect() {
 				# three audits found a different way for it to run away.
 			fi
 			[ "$newrate" -gt "$ceiling" ] && newrate=$ceiling
-			[ "$newrate" -lt 2000 ] && newrate=2000
+			[ "$newrate" -lt "$mfloor" ] && newrate=$mfloor
 			if [ "$newrate" -ne "$rate" ]; then
 				if apply_downlink_rate "$lan" "$bands" "$newrate"; then
 					printf '%s\n' "$newrate" > "$PRIO_STATE/shaper"
@@ -1454,7 +1470,8 @@ EOF
 # ---------------------------------------------------------------------------
 measure() {
 	local dev dl_url ul_url secs a b dl ul f p1 p2 p3 p4
-	local method node lat
+	local method node lat force
+	force="$1"
 	dev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
 	[ -n "$dev" ] || dev="$(state_get wan_iface)"
 	[ -n "$dev" ] || dev=eth2
@@ -1616,7 +1633,14 @@ measure() {
 	MEASURE_NOW="$(date +%s)"
 	guard_reject=0
 	guard_reject_up=0
-	if [ "$dl" -ge 1000 ] && [ "$prev_dl" -ge 5000 ] &&
+	# "measure force" is what the page's button sends: the guard above exists to
+	# stop an AUTOMATIC re-measure from pinning a throttled sample, but a user
+	# pressing the button has just looked at the connection and wants the line
+	# measured again. Without this the guard also blocked the only way out of a
+	# crashed estimate (every recovery attempt was "under half").
+	if [ "$force" = "force" ]; then
+		guard_reject=0
+	elif [ "$dl" -ge 1000 ] && [ "$prev_dl" -ge 5000 ] &&
 	   [ $(( $(date +%s) - prev_at )) -lt 86400 ] &&
 	   [ "$dl" -lt $(( prev_dl * 50 / 100 )) ]; then
 		logger -t luci-app-prio "measurement ${dl}kbit is under half of ${prev_dl}kbit, ignored"
@@ -1638,7 +1662,8 @@ measure() {
 	# for one run, which is the safe direction.
 	prev_ul_at="$(state_get measured_at_up)"
 	case "$prev_ul_at" in ''|*[!0-9]*) prev_ul_at=0 ;; esac
-	if [ "$ul" -ge 1000 ] && [ "$prev_ul" -ge 5000 ] && [ "$prev_ul_at" -gt 0 ] &&
+	if [ "$force" != "force" ] && [ "$ul" -ge 1000 ] && [ "$prev_ul" -ge 5000 ] &&
+	   [ "$prev_ul_at" -gt 0 ] &&
 	   [ $(( $(date +%s) - prev_ul_at )) -lt 86400 ] &&
 	   [ "$ul" -lt $(( prev_ul * 50 / 100 )) ]; then
 		logger -t luci-app-prio "upload ${ul}kbit is under half of ${prev_ul}kbit, ignored"

@@ -456,16 +456,20 @@ o.description = translate("Uses the built-in speedtest client: it picks a mainla
 	"Clicking returns immediately; the test itself runs in the background, so " ..
 	"reload this page in a minute to see the result. " ..
 	"With \"Measure the line automatically\" on and the line idle, a successful run " ..
-	"replaces the remembered rate. A result under half of the previous one within a " ..
-	"day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled " ..
-	"test under half cannot pin the line; a genuine downgrade needs that day to pass, or " ..
-	"switch automatic measurement off and type the rate in by hand.")
+	"replaces the remembered rate. Automatic re-measurements ignore a result under " ..
+	"half of the previous one within a day (when that one was at least 5 Mbit/s), so a " ..
+	"throttled test cannot pin the line; pressing this button overrides that check, " ..
+	"because you have just looked at the connection.")
 o.write = function()
 	-- Detached on purpose: one run takes up to a minute and the old code made
 	-- the browser wait for it, which a proxy or a slow phone turns into a
 	-- timeout. The row above reports progress and the result.
+	-- "force": a clicked measurement skips the under-half guard. That guard is
+	-- there to keep an AUTOMATIC re-measure from pinning a throttled sample,
+	-- but it also blocked the only way out when a long congestion had walked
+	-- the rate close to the floor -- only a power cycle recovered it.
 	require("luci.sys").call(
-		"( /etc/init.d/prio measure; /etc/init.d/prio apply 1 ) </dev/null >/dev/null 2>&1 &")
+		"( /etc/init.d/prio measure force; /etc/init.d/prio apply 1 ) </dev/null >/dev/null 2>&1 &")
 end
 
 o = s:option(Flag, "downlink", translate("Shape Downlink (download)"))
@@ -624,8 +628,20 @@ o.rmempty = true
 -- choice (band 0, the HIGHEST) while the stored value is empty (the LOWEST),
 -- and the page then claims guests get top priority when they get the bottom.
 o:value("", translatef("lowest band, band %d (recommended)", get_bands() - 1))
-for i = 0, get_bands() - 1 do
+-- The lowest band is offered ONCE. Listing it twice (empty and "band N-1") gave
+-- two spellings of the same setting, and the backend maps both to N-1 anyway.
+for i = 0, get_bands() - 2 do
 	o:value(tostring(i), translatef("Band %d", i))
+end
+-- A configuration that already holds the numeric top band (older versions, or
+-- someone typing uci) must not render as "band 0" now that "band N-1" has no
+-- choice of its own: map it onto the empty entry, which means the same thing.
+o.cfgvalue = function(self, section)
+	local ok, v = pcall(function() return uci:get("prio", "main", "default_band") end)
+	if not ok or v == nil or v == "" then return "" end
+	local n = tonumber(v)
+	if n and n == get_bands() - 1 then return "" end
+	return v
 end
 o.description = translate("Everything that is not in the device list still goes through " ..
 	"the shaper; this is the band it gets. Empty means the lowest band, which is the " ..

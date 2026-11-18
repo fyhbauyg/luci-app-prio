@@ -385,9 +385,6 @@ msgstr "正在测量（大约 1 分钟）"
 msgid "the upload measured under half of the last one, so it was ignored"
 msgstr "上传不到上次测量的一半，已忽略"
 
-msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. Clicking returns immediately; the test itself runs in the background, so reload this page in a minute to see the result. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. A result under half of the previous one within a day is ignored when that previous measurement was at least 5 Mbit/s, so a throttled test under half cannot pin the line; a genuine downgrade needs that day to pass, or switch automatic measurement off and type the rate in by hand."
-msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。点一下立刻返回，测速在后台进行，过一分钟刷新本页就能看到结果。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。如果上一次测量至少有 5 Mbit/s，一天之内低于它一半的结果会被忽略，这样一次被限速的测速不会把速率钉死；真的降速了得等过这一天，或者关掉自动测量手动填速率。"
-
 msgid "the priority engine is switched off"
 msgstr "优先级引擎已关闭"
 
@@ -396,3 +393,6 @@ msgstr "每个带内按流公平排队（fq_codel）"
 
 msgid "Ticked: fq_codel queues every flow separately with a 3 ms target, so while a band is being served its flows see only a few milliseconds of queueing. That is per flow, not per host: a downloader with many connections still takes many shares. Cleared: a band is one bounded first-in-first-out queue (about 200 ms at 60 Mbit), so a device that keeps it full owns the band and the others wait behind it -- dog-eat-dog. Either way only the inside of a band changes: the ETS priority between bands is untouched, a busy higher strict band (band 0 by default) holds the lower bands back for as long as it stays busy, and the non-strict bands share whatever the strict ones leave."
 msgstr "勾选：fq_codel 按流分开排队、目标延迟 3ms，所以一条带在被服务时，它的各个流只看到几毫秒的排队。注意这是按流而不是按设备公平：开很多连接的下载器仍然会拿走很多份额。取消勾选：一条带就是一条有上限的先进先出队列（60 Mbit 下约 200ms），谁把它灌满谁就独占这条带，其他设备在后面干等——弱肉强食。两种模式都只改变一条带内部的行为：带与带之间的 ETS 优先级不受影响；上层严格带（默认只有带 0）只要还在忙，下面的带就会一直被压着；非严格带只分享严格带剩下的带宽。"
+
+msgid "Uses the built-in speedtest client: it picks a mainland node (Guangzhou/Shenzhen Unicom here), runs several parallel streams and records what the line actually delivered. It costs real traffic -- roughly 300 MB on a fast line. Clicking returns immediately; the test itself runs in the background, so reload this page in a minute to see the result. With \"Measure the line automatically\" on and the line idle, a successful run replaces the remembered rate. Automatic re-measurements ignore a result under half of the previous one within a day (when that one was at least 5 Mbit/s), so a throttled test cannot pin the line; pressing this button overrides that check, because you have just looked at the connection."
+msgstr "用固件自带的测速客户端：自动挑一个大陆节点（这里是广州/深圳联通），多线程并发，记录线路实际跑出来的数值。会真实消耗流量，快线大约 300MB。点一下立刻返回，测速在后台进行，过一分钟刷新本页就能看到结果。在「自动测量线路容量」开着、线路空闲时，测量成功会覆盖之前记住的速率。自动重测会忽略「比上次低一半以上」的结果（上一次至少 5 Mbit/s 时），避免一次被限速的测速把速率钉死；而手动点这个按钮会绕过该检查——因为你刚刚亲自看过连接状态。"
