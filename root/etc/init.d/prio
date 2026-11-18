@@ -101,30 +101,35 @@ diag_prune() {
 # engine is stopped or nothing happens for days, so start()/stop() call this
 # too instead of relying on diag() being reached by an event.
 diag_maybe_prune() {
-	local last fail now
+	local last fail now attempt
 	now=$(date +%s)
 	last=$(cat "$PRIO_STATE/diag_prune" 2>/dev/null)
 	case "$last" in ''|*[!0-9]*) last=0 ;; esac
 	fail=$(cat "$PRIO_STATE/diag_prune_fail" 2>/dev/null)
 	case "$fail" in ''|*[!0-9]*) fail=0 ;; esac
 
-	if [ $(( now - last )) -ge 86400 ]; then
-		if diag_prune; then
-			printf '%s\n' "$now" > "$PRIO_STATE/diag_prune" 2>/dev/null
-			: > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
-		else
-			printf '%s\n' "$now" > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
-		fi
-		return 0
+	# When to try: once a day, or -- after a recorded failure -- every 600 s.
+	# The daily branch must be gated on "no failure recorded": a failed prune
+	# leaves `last` stale, and without that gate every later call re-enters the
+	# daily branch and prunes on each ~20 s window.
+	# DIAG_TRY_AT is a shell variable, so it also bounds the case where even the
+	# stamps cannot be written (read-only overlay, full flash): it only resets
+	# when the process restarts.
+	attempt=0
+	if [ "$fail" -eq 0 ] && [ $(( now - last )) -ge 86400 ]; then
+		attempt=1
+	elif [ "$fail" -gt 0 ] && [ $(( now - fail )) -ge 600 ]; then
+		attempt=1
 	fi
-	# Inside the day: retry ONLY after a failure, and at most every ten
-	# minutes. The loop calls this about twice a minute, and a permanently
-	# broken prune must not run on every one of those windows.
-	[ "$fail" -gt 0 ] || return 0
-	[ $(( now - fail )) -ge 600 ] || return 0
+	[ "$attempt" = 1 ] || return 0
+	[ $(( now - ${DIAG_TRY_AT:-0} )) -ge 600 ] || return 0
+	DIAG_TRY_AT=$now
+
 	if diag_prune; then
 		printf '%s\n' "$now" > "$PRIO_STATE/diag_prune" 2>/dev/null
 		: > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
+	else
+		printf '%s\n' "$now" > "$PRIO_STATE/diag_prune_fail" 2>/dev/null
 	fi
 }
 
