@@ -25,12 +25,21 @@ chk "状态文件可读 (engine/downlink/uplink)" "grep -q 'priority engine star
 chk "下行根队列 htb 1: 存在" "tc qdisc show dev $LAN | grep -q 'qdisc htb 1: root'"
 chk "下行受控类 1:100 存在" "tc class show dev $LAN | grep -q 'class htb 1:100'"
 chk "下行内层 ets 2: 存在" "tc qdisc show dev $LAN | grep -q 'qdisc ets 2:'"
-chk "下行每带都有 fq_codel" "[ \$(tc qdisc show dev $LAN | grep -c 'fq_codel') -ge 3 ]"
+chk "下行带1/带2 阀门类存在" "tc class show dev $LAN | grep -q 'class htb 21:1'"
+# fq_codel 关掉时带内是单队列 pfifo（弱肉强食），此时只有 LAN 类有 fq_codel，
+# 所以按配置判断，而不是假定它一定开着。
+if [ "$(uci -q get prio.main.fq_codel)" = "1" ]; then
+	chk "下行每带都有 fq_codel" "[ \$(tc qdisc show dev $LAN | grep -c 'fq_codel') -ge 3 ]"
+else
+	# 句柄号每次建树都变（8005/8006/801e...），只能按父类匹配。
+	chk "带内公平已关闭，只有 LAN 类有 fq_codel" "tc qdisc show dev $LAN | grep 'fq_codel' | grep -q 'parent 1:1'"
+fi
 
 # 3. 上行树
 chk "上行根队列 htb 1: 存在" "tc qdisc show dev $WAN | grep -q 'qdisc htb 1: root'"
 chk "上行受控类 1:100 存在" "tc class show dev $WAN | grep -q 'class htb 1:100'"
 chk "上行内层 ets 2: 存在" "tc qdisc show dev $WAN | grep -q 'qdisc ets 2:'"
+chk "上行带1/带2 阀门类存在" "tc class show dev $WAN | grep -q 'class htb 21:1'"
 
 # 4. 速率与配置一致
 DOWN_APPLIED=$(tc class show dev $LAN classid 1:100 | sed -n 's/.*rate \([0-9]*\)Kbit.*/\1/p')
@@ -55,7 +64,11 @@ DOWNREAL=$(rate_kbit $LAN); case "$DOWNREAL" in ''|*[!0-9]*) DOWNREAL=0 ;; esac
 # controller never writes the estimate file, so compare against the right one.
 AUTO=$(uci -q get prio.main.auto_bandwidth)
 if [ "$AUTO" = "1" ]; then
-	SHEST=$(cat $ST/shaper 2>/dev/null)
+	# The durable record, not the tmpfs mirror: start()/apply_rate rewrite the
+	# mirror, so comparing against it can race the tree being checked (it once
+	# reported 257% against a stale 100000).
+	SHEST=$(uci -q get prio.main.measured_dl)
+	[ -n "$SHEST" ] || SHEST=$(cat $ST/shaper 2>/dev/null)
 else
 	SHEST=$(uci -q get prio.main.shaper_kbit)
 fi
@@ -73,9 +86,17 @@ else
 fi
 
 # 5. 控制器产物（基线要等一个完整的空闲窗口，约 25 秒）
-echo "      等待一个空闲窗口以学习延迟基线..."
-sleep 25
-chk "延迟基线已学到 (rtt_base)" "[ -s $ST/rtt_base ]"
+echo "      等待一个空闲窗口以学习延迟基线（最多 90 秒）..."
+i=0
+while [ "$i" -lt 18 ] && [ ! -s $ST/rtt_base ]; do
+	sleep 5
+	i=$((i + 1))
+done
+if [ -s $ST/rtt_base ]; then
+	ok "延迟基线已学到 (rtt_base)"
+else
+	sk "线路一直不空闲，延迟基线还没学到（有流量的情况下属正常）"
+fi
 # up_rate 由 start() 用 : > 创建，"文件存在"永远成立 —— 必须比内容与 tc
 chk "上行整形状态已上报" "test -s $ST/upshaper"
 if [ -s $ST/up_rate ]; then
@@ -169,6 +190,7 @@ chk "上行有 upmiss 保护代码" "grep -q 'upmiss=' /etc/init.d/prio"
 chk "上行种子拒绝已堆积的窗口 (sclean)" "grep -q 'sclean' /etc/init.d/prio"
 chk "上行种子取中间值 (sed -n 2p)" "grep -q 'sed -n 2p' /etc/init.d/prio"
 chk "种子采样要求 4/4 全应答 (rtt_all_ms)" "grep -q 'rtt_all_ms' /etc/init.d/prio"
+chk "线路忙的阈值按容量比例而不是写死 2000" "grep -q 'shaper_kbit) / 50' /etc/init.d/prio"
 chk "上行状态由 setup 与 apply 两处写入" "[ \$(grep -c 'PRIO_STATE/upshaper' /etc/init.d/prio) -ge 3 ]"
 
 

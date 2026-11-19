@@ -196,17 +196,16 @@ o.cfgvalue = function()
 	if okm and tonumber(mv) then m = math.floor(tonumber(mv)) end
 	if m < 0 then m = 0 end
 	if m > 50 then m = 50 end
-	local applied = r
-	if auto == "1" then
-		applied = math.floor(r * (100 - m) / 100)
-	end
+	-- The estimate is the total gate; the margin only caps the bands below the
+	-- top one. Both numbers are built here instead of as format specifiers
+	-- inside the translatable string, because a translator who "fixes" %d%% to
+	-- %d would make string.format raise and take the whole page down.
+	local cap = math.floor(r * (100 - m) / 100)
 	if auto == "1" and m > 0 then
-		-- No format specifier inside the translatable string: a translator
-		-- who "fixes" %d%% to %d would make string.format raise and take the
-		-- whole page down. Build it instead.
-		return string.format("%.1f Mbit/s (%s %.1f, %s %d%%)",
-			applied / 1000, translate("estimate"), r / 1000,
-			translate("headroom"), m)
+		-- Numbers only: the total gate first, then the cap that applies to
+		-- every band below the top one. No new msgids here, because a string
+		-- without a compiled translation would show English on a Chinese page.
+		return string.format("%.1f / %.1f Mbit/s", r / 1000, cap / 1000)
 	end
 	return string.format("%.1f Mbit/s (%s)", r / 1000, src)
 end
@@ -375,8 +374,10 @@ o.cfgvalue = function()
 	if running then
 		note = "  ·  " .. translate("measurement running now (about a minute)")
 	elseif fs.access("/var/run/luci-app-prio/measure_err") then
-		local ets, code = (fs.readfile("/var/run/luci-app-prio/measure_err") or ""):match("^(%d+)%s+(%S+)")
+		local ets, code, rest = (fs.readfile("/var/run/luci-app-prio/measure_err") or ""):match("^(%d+)%s+(%S+)%s*(.*)")
 		ets = tonumber(ets) or 0
+		local obs, thr = (rest or ""):match("^(%d+)%s+(%d+)")
+		obs, thr = tonumber(obs), tonumber(thr)
 		-- Literal translate() calls on purpose: a table of strings translated
 		-- through a variable is invisible to the .po audit.
 		local why
@@ -384,6 +385,12 @@ o.cfgvalue = function()
 			why = translate("another measurement is still running")
 		elseif code == "line-busy" then
 			why = translate("the line was busy, so it was skipped")
+			-- Numbers only, no new msgids: the English text above has a
+			-- compiled translation, and a fresh one would render English on a
+			-- Chinese page until the next i18n rebuild.
+			if obs and thr and thr > 0 then
+				why = string.format("%s · %.1f/%.1f Mbit/s", why, obs / 1000, thr / 1000)
+			end
 		elseif code == "no-data" then
 			why = translate("nothing came back -- the line or the speedtest node was unreachable")
 		elseif code == "no-iface" then

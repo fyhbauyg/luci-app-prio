@@ -5,6 +5,10 @@
 *.o
 *.so
 
+# dist/ 里放的是发布用的成品包，要跟着仓库走（Release 工作流从这里取）
+!dist/
+!dist/*.apk
+
 # 编辑器 / 系统
 .DS_Store
 Thumbs.db

@@ -167,7 +167,14 @@ diag_bands() {
 
 mea_fail() {
 	mkdir -p "$PRIO_STATE" 2>/dev/null
-	printf '%s %s\n' "${MEASURE_NOW:-$(date +%s)}" "$1" > "$PRIO_STATE/measure_err" 2>/dev/null
+	# Optional extra fields: line-busy carries "observed threshold" in kbit so
+	# the page can say how much traffic blocked the run instead of only that
+	# something did.
+	local extra
+	extra=""
+	[ -n "$2" ] && extra=" $2"
+	[ -n "$3" ] && extra="$extra $3"
+	printf '%s %s%s\n' "${MEASURE_NOW:-$(date +%s)}" "$1" "$extra" > "$PRIO_STATE/measure_err" 2>/dev/null
 }
 mea_ok() {
 	mkdir -p "$PRIO_STATE" 2>/dev/null
@@ -296,6 +303,70 @@ applied_kbit() {
 	fi
 	m="$(margin_pct)"
 	echo $(( est * (100 - m) / 100 ))
+}
+
+# Valve for every band except the top one: the same number the old code handed
+# to tc as the global shaped rate (estimate minus the safety margin). The margin
+# no longer comes off the total, so the top band may use the whole measured
+# capacity while every lower band is held below the knee.
+valve_of() {
+	local r="$1" m v
+	case "$r" in ''|*[!0-9]*) r=0 ;; esac
+	[ "$r" -ge 1000 ] 2>/dev/null || { echo 0; return 0; }
+	m="$(margin_pct)"
+	v=$(( r * (100 - m) / 100 ))
+	[ "$v" -lt 2000 ] && v=2000
+	[ "$v" -gt "$r" ] && v="$r"
+	echo "$v"
+}
+
+# Total gate handed to tc verbatim.
+total_kbit() {
+	shaper_kbit
+}
+
+valve_kbit() {
+	valve_of "$(total_kbit)"
+}
+
+# Per-band valve: every band except the top one gets its own HTB class capped at
+# $valve, so a lower band can never take the whole line. The top band stays
+# unshaped inside the ETS scheduler and may reach the total gate.
+add_band_valves() {
+	local dev="$1" bands="$2" valve="$3"
+	local b vh vb
+	[ "$valve" -ge 1000 ] 2>/dev/null || return 0
+	[ "$bands" -gt 1 ] 2>/dev/null || return 0
+	b=1
+	while [ "$b" -lt "$bands" ]; do
+		vh=$((20 + b))
+		vb=$(( valve / 8 * 20 ))
+		[ "$vb" -lt 8192 ] && vb=8192
+		[ "$vb" -gt 128000 ] && vb=128000
+		tc qdisc add dev "$dev" parent "2:$((b + 1))" handle "${vh}:" htb default 1 2>>"$PRIO_STATE/err"
+		tc class add dev "$dev" parent "${vh}:" classid "${vh}:1" htb \
+			rate "${valve}kbit" ceil "${valve}kbit" burst "${vb}b" cburst "${vb}b" 2>>"$PRIO_STATE/err"
+		b=$((b + 1))
+	done
+	return 0
+}
+
+# Rate changes must not rebuild the tree, so the valves are changed in place.
+set_band_valves() {
+	local dev="$1" bands="$2" valve="$3"
+	local b vh vb
+	[ "$valve" -ge 1000 ] 2>/dev/null || return 0
+	b=1
+	while [ "$b" -lt "$bands" ]; do
+		vh=$((20 + b))
+		vb=$(( valve / 8 * 20 ))
+		[ "$vb" -lt 8192 ] && vb=8192
+		[ "$vb" -gt 128000 ] && vb=128000
+		tc class change dev "$dev" parent "${vh}:" classid "${vh}:1" htb \
+			rate "${valve}kbit" ceil "${valve}kbit" burst "${vb}b" cburst "${vb}b" 2>>"$PRIO_STATE/err"
+		b=$((b + 1))
+	done
+	return 0
 }
 
 # Rate for the LAN class. 0 in the config means "detect": the highest link
@@ -576,8 +647,8 @@ setup_nft() {
 
 # ---------------- helpers ----------------
 band_leaves() {
-	local dev="$1" bands="$2" handle="${3:-1}"
-	local fq
+	local dev="$1" bands="$2" handle="${3:-1}" valve="${4:-0}"
+	local fq p
 	fq="$(state_get fq_codel)"
 	[ -n "$fq" ] || fq=1
 	[ "$fq" = "1" ] || return 0
@@ -588,7 +659,14 @@ band_leaves() {
 	# constraint fq_codel puts on the pair.
 	local i=1
 	while [ "$i" -le "$bands" ]; do
-		tc qdisc add dev "$dev" parent "${handle}:$i" fq_codel target 3ms 2>>"$PRIO_STATE/err"
+		# Band 1 (index 0) is never valved, so its leaf hangs directly off the
+		# ETS band; the others hang off the HTB class that enforces the valve.
+		if [ "$i" -gt 1 ] && [ "$valve" -ge 1000 ] 2>/dev/null; then
+			p="$((19 + i)):1"
+		else
+			p="${handle}:$i"
+		fi
+		tc qdisc add dev "$dev" parent "$p" fq_codel target 3ms 2>>"$PRIO_STATE/err"
 		i=$((i + 1))
 	done
 }
@@ -653,12 +731,19 @@ set_up_rate() {
 
 apply_uplink_rate() {
 	local dev="$1" rate="$2"
-	local burst=$((rate / 8 * 20))
+	local burst valve bands
+	case "$rate" in ''|*[!0-9]*) rate=0 ;; esac
+	bands="$(state_get bands)"
+	case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
+	burst=$((rate / 8 * 20))
 	[ "$burst" -lt 8192 ] && burst=8192
 	[ "$burst" -gt 128000 ] && burst=128000
 	tc class change dev "$dev" parent 1: classid 1:100 \
 		htb rate "${rate}kbit" ceil "${rate}kbit" \
 		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err" || return 1
+	valve="$(valve_of "$rate")"
+	set_band_valves "$dev" "$bands" "$valve"
+	refresh_status_rate upvalve "$rate" "$valve"
 	# The page reads this; setup_uplink only writes it once at start(), so the
 	# controller has to keep it current. It lives in its own file: the old
 	# version rewrote the shared status file (grep into a temp file, then mv),
@@ -674,7 +759,7 @@ apply_uplink_rate() {
 # router never sees them. With a rate the queue is ours and the bands matter.
 setup_uplink() {
 	local dev="$1" bands="$2"
-	local rate applied
+	local rate applied valve
 
 	rate="$(up_rate_kbit)"
 	applied=$rate
@@ -685,9 +770,12 @@ setup_uplink() {
 	# anyway at a rate the link can never reach, so the controller can start
 	# shaping later without rebuilding -- and measure the upload first.
 	local upauto=0
+	valve=0
 	if [ "$applied" -lt 1000 ]; then
 		applied=1000000
 		upauto=1
+	else
+		valve="$(valve_of "$applied")"
 	fi
 
 	local burst=$((applied / 8 * 20))
@@ -716,8 +804,10 @@ setup_uplink() {
 		echo "uplink:fail" >> "$PRIO_STATE/status"
 		return 1
 	fi
-	band_leaves "$dev" "$bands" 2
+	add_band_valves "$dev" "$bands" "$valve"
+	band_leaves "$dev" "$bands" 2 "$valve"
 	setup_filters "$dev" "$bands" 2
+	echo "upvalve:${valve}kbit" >> "$PRIO_STATE/status"
 	echo "uplink:ok" >> "$PRIO_STATE/status"
 	if [ "$upauto" = 1 ]; then
 		# "auto" means the detector is going to measure the upload. When the
@@ -742,9 +832,10 @@ setup_uplink() {
 # rate so the ETS inside it has a real queue to reorder.
 setup_downlink() {
 	local dev="$1" bands="$2"
-	local rate applied
+	local rate applied valve
 	rate="$(shaper_kbit)"
-	applied="$(applied_kbit "$rate")"
+	applied="$(total_kbit)"
+	valve="$(valve_of "$applied")"
 
 	# Strip our own lines before re-emitting them; the detector calls this
 	# repeatedly and must not accumulate duplicate status rows.
@@ -803,7 +894,9 @@ setup_downlink() {
 			echo "downlink:fail" >> "$PRIO_STATE/status"
 			return 1
 		fi
+		add_band_valves "$dev" "$bands" "$valve"
 		echo "shaper:${applied}kbit" >> "$PRIO_STATE/status"
+		echo "valve:${valve}kbit" >> "$PRIO_STATE/status"
 	else
 		# No rate learned yet: classification only, no queue (priority is inert
 		# until the detector has seen enough traffic).
@@ -814,7 +907,7 @@ setup_downlink() {
 		echo "shaper:pending" >> "$PRIO_STATE/status"
 	fi
 
-	band_leaves "$dev" "$bands" 2
+	band_leaves "$dev" "$bands" 2 "$valve"
 	setup_filters "$dev" "$bands" 2
 	# "ok" used to be written even on the classification-only path, so the page
 	# claimed "downlink OK" while no queue existed and priority was inert.
@@ -899,15 +992,40 @@ stop_detect() {
 # Change only the HTB rate when the tree already exists. A full setup_downlink
 # deletes the root qdisc, which drops the whole queue and stutters every TCP
 # flow; rate changes are frequent, structural changes are not.
+# Replace our own two lines in the status file without dropping the rows other
+# writers appended in the meantime.
+refresh_status_rate() {
+	local key="$1" total="$2" valve="$3" st="$PRIO_STATE/status" tmp
+	[ -f "$st" ] || return 0
+	tmp="$st.$$"
+	grep -vE "^(${key}|valve|upvalve):" "$st" > "$tmp" 2>/dev/null
+	printf '%s:%skbit\n' "$key" "$total" >> "$tmp"
+	if [ "$key" = "shaper" ]; then
+		printf 'valve:%skbit\n' "$valve" >> "$tmp"
+	else
+		printf 'upvalve:%skbit\n' "$valve" >> "$tmp"
+	fi
+	mv "$tmp" "$st" 2>/dev/null
+}
+
 apply_rate() {
-	local dev="$1" rate
-	rate="$(applied_kbit "$2")"
-	local burst=$((rate / 8 * 20))
+	local dev="$1" rate="$2"
+	local burst valve bands
+	case "$rate" in ''|*[!0-9]*) rate=0 ;; esac
+	bands="$(state_get bands)"
+	case "$bands" in 3|4|8) ;; *) bands=3 ;; esac
+	burst=$((rate / 8 * 20))
 	[ "$burst" -lt 8192 ] && burst=8192
 	[ "$burst" -gt 256000 ] && burst=256000
 	tc class change dev "$dev" parent 1: classid 1:100 \
 		htb rate "${rate}kbit" ceil "${rate}kbit" \
 		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"
+	valve="$(valve_of "$rate")"
+	set_band_valves "$dev" "$bands" "$valve"
+	# The page reads these lines. An in-place change used to leave the previous
+	# numbers behind until the next full rebuild, so the status row disagreed
+	# with the live tree right after a measurement.
+	refresh_status_rate shaper "$rate" "$valve"
 }
 
 # Either change the rate in place or, when the tree is still the
@@ -1308,8 +1426,8 @@ start_detect() {
 					nup=$(wc -l < "$PRIO_STATE/uptx" 2>/dev/null)
 					case "$nup" in ''|*[!0-9]*) nup=0 ;; esac
 					if [ "$nup" -ge 3 ] && [ "$useed" -ge 3000 ]; then
-						umarg=$(margin_pct)
-						useed=$(( useed * (100 - umarg) / 100 ))
+						# Raw sample: the margin is applied to the
+						# lower bands by apply_uplink_rate, not here.
 						[ "$useed" -lt 2000 ] && useed=2000
 						[ "$useed" -gt "$ceiling" ] && useed=$ceiling
 						if apply_uplink_rate "$dev" "$useed"; then
@@ -1641,15 +1759,23 @@ measure() {
 	# during someone else's download reported 433 Mbit on a 200 Mbit line and
 	# pushed the shaper above the capacity, which is exactly the failure that
 	# makes priority useless.
-	local i0 i1
+	local i0 i1 bobs bthr
 	i0=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
 	sleep 2
 	i1=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
 	case "$i0$i1" in ''|*[!0-9]*) ;; *)
-		if [ $(( (i1 - i0) * 8 / 2 / 1000 )) -gt 2000 ]; then
+		bobs=$(( (i1 - i0) * 8 / 2 / 1000 ))
+		# Proportional threshold. A flat 2000 kbit/s was 10% of the 20 Mbit
+		# 4G line this feature was written for, but only 0.8% of a 267 Mbit
+		# line: there, a phone scrolling a feed already exceeds it and the
+		# button can never run. 2% of the last estimate keeps the guard real
+		# while letting ordinary background traffic through.
+		bthr=$(( $(shaper_kbit) / 50 ))
+		[ "$bthr" -lt 2000 ] && bthr=2000
+		if [ "$bobs" -gt "$bthr" ]; then
 			echo "measure:busy"
-			logger -t luci-app-prio "measurement skipped: link is busy"
-			mea_fail line-busy
+			logger -t luci-app-prio "measurement skipped: link is busy (${bobs} kbit/s > ${bthr})"
+			mea_fail line-busy "$bobs" "$bthr"
 			return 1
 		fi
 		;;
@@ -1880,12 +2006,11 @@ measure() {
 		# overwrite the live cut the control loop made and raise the uplink.
 		if [ "$ulok" = 1 ] && [ "$guard_reject_up" != 1 ] &&
 		   [ "$ul" -ge 1000 ] && [ "$mup" -lt 1000 ] && [ "$(state_get uplink)" = "1" ]; then
-			# The uplink has no margin anywhere else in the chain, so it is
-			# applied here: shaping at the measured value itself puts the queue
-			# straight back into the modem.
-			local um ulshape
-			um="$(margin_pct)"
-			ulshape=$(( ul * (100 - um) / 100 ))
+			# The measured upload is the total gate. apply_uplink_rate()
+			# derives the lower-band valve from it, so the margin is no
+			# longer taken off here.
+			local ulshape
+			ulshape=$ul
 			[ "$ulshape" -lt 2000 ] && ulshape=2000
 			[ "$ulshape" -gt 200000 ] && ulshape=200000
 			state_set uplink_learned "$ulshape"
@@ -1912,6 +2037,27 @@ start() {
 
 	mkdir -p "$PRIO_STATE" 2>/dev/null
 	acquire_lock || return 1
+
+	# One-shot migration from the old "margin on the total" model. The stored
+	# uplink numbers were already reduced by the margin; the new model stores
+	# the raw capacity and takes the margin off the lower bands only. Scaling
+	# them back once keeps the first window after the upgrade at the same real
+	# rate instead of losing the margin twice.
+	if [ ! -f "$PRIO_STATE/ratemodel" ]; then
+		local mp ulv urv
+		mp="$(margin_pct)"
+		ulv="$(state_get uplink_learned)"
+		case "$ulv" in ''|*[!0-9]*) ulv=0 ;; esac
+		if [ "$ulv" -ge 1000 ]; then
+			state_set uplink_learned $(( ulv * 100 / (100 - mp) ))
+		fi
+		urv="$(cat "$PRIO_STATE/up_rate" 2>/dev/null)"
+		case "$urv" in ''|*[!0-9]*) urv=0 ;; esac
+		if [ "$urv" -ge 1000 ]; then
+			printf '%s\n' $(( urv * 100 / (100 - mp) )) > "$PRIO_STATE/up_rate" 2>/dev/null
+		fi
+		printf '2\n' > "$PRIO_STATE/ratemodel" 2>/dev/null
+	fi
 	: > "$PRIO_STATE/status"
 	: > "$PRIO_STATE/err"
 	: > "$PRIO_STATE/ipmap"

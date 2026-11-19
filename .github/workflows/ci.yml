@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: 语法与翻译检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装检查工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq busybox-static lua5.1 gettext shellcheck jq
+
+      - name: Shell 语法（dash 与 busybox ash 各一遍）
+        run: |
+          set -e
+          for f in root/etc/init.d/prio tools/prio-selftest.sh; do
+            echo "== $f"
+            sh -n "$f"
+            busybox ash -n "$f"
+          done
+
+      - name: shellcheck
+        run: |
+          shellcheck -s sh -S error root/etc/init.d/prio tools/prio-selftest.sh
+
+      - name: Lua 语法
+        run: |
+          luac5.1 -p luasrc/controller/prio.lua luasrc/model/cbi/prio.lua
+
+      - name: JSON 合法性
+        run: |
+          set -e
+          for f in $(git ls-files '*.json'); do
+            echo "== $f"
+            jq -e . "$f" > /dev/null
+          done
+
+      - name: 中文翻译
+        run: |
+          set -e
+          msgfmt --check --statistics -o /dev/null po/zh_Hans/prio.po
+
+      - name: 文件权限
+        run: |
+          set -e
+          test -x root/etc/init.d/prio
+          test -x tools/prio-selftest.sh

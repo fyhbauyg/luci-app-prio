@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的版本号，例如 v1.0.0-r110（不存在会自动创建）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 发版
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: ver
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *)  TAG="v${TAG}" ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "发布 ${TAG}"
+
+      - name: 准备产物
+        run: |
+          set -e
+          cp tools/prio-selftest.sh dist/prio-selftest.sh
+          ls -l dist/
+          ls dist/*.apk > /dev/null
+
+      - name: 生成校验和
+        run: |
+          set -e
+          cd dist
+          sha256sum *.apk prio-selftest.sh > ../sha256sums.txt
+          cat ../sha256sums.txt
+
+      - name: 生成 release 说明
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          {
+            echo "## luci-app-prio ${VERSION}"
+            echo
+            echo "架构 \`all\`，任何 OpenWrt / ImmortalWrt 设备通用。"
+            echo
+            echo "### 安装"
+            echo
+            echo '```sh'
+            echo "apk add --allow-untrusted --force-overwrite luci-app-prio-*.apk"
+            echo "apk add --allow-untrusted --force-overwrite luci-i18n-prio-zh-cn-*.apk"
+            echo "/etc/init.d/prio reload"
+            echo '```'
+            echo
+            echo "opkg 系统把 \`apk add\` 换成 \`opkg install\`。装完在 LuCI 里打开「网络 → 设备优先级」，勾选启用并保存。"
+            echo
+            echo "### 校验"
+            echo
+            echo '```sh'
+            echo "sha256sum -c sha256sums.txt"
+            echo '```'
+            echo
+            echo "### 说明"
+            echo
+            echo "- 翻译包的版本号跟着编译时的 luci feed 走，对不上时从源码重新编译一遍即可"
+            echo "- 插件会自动关掉硬件 HNAT（必须关，否则 qdisc 被绕过）"
+            echo "- \`prio-selftest.sh\` 会临时改写上行速率并跑一次实测（快线上约 300 MB 流量），跑完会恢复"
+          } > release-body.md
+          cat release-body.md
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: luci-app-prio ${{ steps.ver.outputs.version }}
+          body_path: release-body.md
+          files: |
+            dist/*.apk
+            dist/prio-selftest.sh
+            sha256sums.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          make_latest: true
