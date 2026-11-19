@@ -569,12 +569,16 @@ setup_nft() {
 	local lan="$3"
 	PRIO_BANDS_MAX=$((bands - 1))
 	# Devices that are not in the list still have to be managed: they get this
-	# band, which defaults to the lowest (worst) priority. Without a default the
-	# unlisted traffic simply skipped the shaper -- an unmanaged phone uploaded
-	# at 80 Mbit while every managed device sat under the cap.
+	# band. Without a default the unlisted traffic simply skipped the shaper --
+	# an unmanaged phone uploaded at 80 Mbit while every managed device sat
+	# under the cap.
+	#
+	# The default is band 1, not the lowest: a guest phone should not land in
+	# the worst class just by joining, and a configured device still outranks
+	# it unless that device is itself on the last band.
 	local dband
 	dband="$(state_get default_band)"
-	case "$dband" in ''|*[!0-9]*) dband="$PRIO_BANDS_MAX" ;; esac
+	case "$dband" in ''|*[!0-9]*) dband=1 ;; esac
 	[ "$dband" -gt "$PRIO_BANDS_MAX" ] && dband="$PRIO_BANDS_MAX"
 
 	nft delete table $NFT_TABLE 2>/dev/null

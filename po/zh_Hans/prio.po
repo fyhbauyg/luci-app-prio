@@ -319,8 +319,8 @@ msgstr "%d 小时前"
 msgid "Priority for devices not in the list"
 msgstr "未列出设备的优先级"
 
-msgid "Everything that is not in the device list still goes through the shaper; this is the band it gets. Empty means the lowest band, which is the safe choice: a new device cannot take bandwidth away from one you configured."
-msgstr "不在设备列表里的设备同样会经过整形器，这里指定它落在哪条带。留空表示最低的那条带 —— 这是安全的选择：新接入的设备不会抢走你已经配置好的设备的带宽。"
+msgid "Everything that is not in the device list still goes through the shaper; this is the band it gets."
+msgstr "不在设备列表里的设备同样会经过整形器，这里指定它落在哪条带。"
 
 msgid "Separate upload priority"
 msgstr "分开设置上传优先级"
@@ -348,9 +348,6 @@ msgstr "立即测量（线路慢时最多约 1 分钟）"
 
 msgid "Only used when \"Measure the line automatically\" is off. 0 leaves the downlink unshaped."
 msgstr "只在关掉「自动测量线路容量」时生效。填 0 表示下行不限速。"
-
-msgid "lowest band, band %d (recommended)"
-msgstr "最低带，带 %d（推荐）"
 
 msgid "no local backlog in the last window -- traffic never exceeded the shaping rate. Normal on a quiet line; also what a rate set above the line's real capacity looks like."
 msgstr "上一窗口内本地没有积压——流量一直没超过整形速率。线路空闲时这是正常的，但整形速率高于线路真实能力时也是这个样子。"

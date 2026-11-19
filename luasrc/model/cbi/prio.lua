@@ -703,30 +703,26 @@ o:value("8", translate("8 bands"))
 o.description = translate("Band 0 has the absolute highest priority. The remaining bands share bandwidth fairly.")
 
 o = s:option(ListValue, "default_band", translate("Priority for devices not in the list"))
-o.default = ""
-o.rmempty = true
--- Empty must have its own entry. Without one, a ListValue renders the first
--- choice (band 0, the HIGHEST) while the stored value is empty (the LOWEST),
--- and the page then claims guests get top priority when they get the bottom.
-o:value("", translatef("lowest band, band %d (recommended)", get_bands() - 1))
--- The lowest band is offered ONCE. Listing it twice (empty and "band N-1") gave
--- two spellings of the same setting, and the backend maps both to N-1 anyway.
-for i = 0, get_bands() - 2 do
+o.default = 1
+o.rmempty = false
+-- Every band is offered once, as a plain number. The old list had a separate
+-- "lowest band (recommended)" entry that meant the same thing as the numeric
+-- last band, so the same setting appeared twice under different wording.
+for i = 0, get_bands() - 1 do
 	o:value(tostring(i), translatef("Band %d", i))
 end
--- A configuration that already holds the numeric top band (older versions, or
--- someone typing uci) must not render as "band 0" now that "band N-1" has no
--- choice of its own: map it onto the empty entry, which means the same thing.
+-- An empty value (fresh install, or a config written before this existed)
+-- means the default band, which is 1.
 o.cfgvalue = function(self, section)
 	local ok, v = pcall(function() return uci:get("prio", "main", "default_band") end)
-	if not ok or v == nil or v == "" then return "" end
-	local n = tonumber(v)
-	if n and n == get_bands() - 1 then return "" end
-	return v
+	local maxb = get_bands() - 1
+	local n = ok and tonumber(v) or nil
+	if not n then return "1" end
+	if n < 0 or n > maxb then return tostring(maxb) end
+	return tostring(n)
 end
 o.description = translate("Everything that is not in the device list still goes through " ..
-	"the shaper; this is the band it gets. Empty means the lowest band, which is the " ..
-	"safe choice: a new device cannot take bandwidth away from one you configured.")
+	"the shaper; this is the band it gets.")
 
 o = s:option(Flag, "split_bands", translate("Separate upload priority"))
 o.default = 0
