@@ -220,14 +220,8 @@ msgstr "下行整形器挂载的接口，通常是 br-lan。"
 msgid "engine not running"
 msgstr "引擎未运行"
 
-msgid "estimate"
-msgstr "估计"
-
 msgid "hardware hook"
 msgstr "硬件钩子"
-
-msgid "headroom"
-msgstr "留"
 
 msgid "idle (no traffic in the last minute)"
 msgstr "空闲（最近一分钟没有流量）"
@@ -429,3 +423,9 @@ msgstr "记录速率变化、测量结果，以及每隔几分钟对每条带做
 
 msgid "Same as download"
 msgstr "与下载相同"
+
+msgid "LAN and WAN must be different interfaces"
+msgstr "LAN 和 WAN 不能是同一个接口"
+
+msgid "Out of range"
+msgstr "超出范围"

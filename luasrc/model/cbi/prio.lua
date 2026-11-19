@@ -190,7 +190,10 @@ o.cfgvalue = function()
 		r = ok1 and tonumber(learned) or 0
 		src = translate("learned")
 	end
-	if r < 1000 then
+	-- Only in manual mode: with automatic measurement on the engine ignores
+	-- shaper_kbit outright, and showing it here advertised a rate that is not
+	-- being enforced.
+	if r < 1000 and auto ~= "1" then
 		local ok, cfg = pcall(function() return uci:get("prio", "main", "shaper_kbit") end)
 		r = ok and tonumber(cfg) or 0
 		src = translate("manual")
@@ -540,6 +543,14 @@ o.rmempty = false
 
 o = s:option(Value, "shaper_kbit", translate("Downlink rate (kbit/s)"))
 o.datatype = "uinteger"
+-- The engine does arithmetic on this before handing it to tc; a few extra
+-- zeros overflow it and tc then gets a nonsense rate.
+o.validate = function(self, value)
+	if not value or value == "" then return value end
+	local n = tonumber(value)
+	if not n or n < 0 or n > 20000000 then return nil, translate("Out of range") end
+	return value
+end
 o.placeholder = "15000"
 -- Stays visible on purpose. Hiding it with o:depends made CBI drop the field
 -- from the POST, and because rmempty is true the save then DELETED the user's
@@ -578,6 +589,11 @@ o.validate = function(self, value)
 		return nil, translate("Enter a whole number in kbit/s, or 0 for automatic.")
 	end
 	local n = tonumber(value)
+	-- The engine does arithmetic on this before handing it to tc; a few extra
+	-- zeros overflow it and tc then gets a nonsense rate.
+	if n and n > 20000000 then
+		return nil, translate("Out of range")
+	end
 	if n and n > 0 and n < 1000 then
 		return nil, translate("Use 0 for automatic, or at least 1000 kbit/s: " ..
 			"smaller values mean \"automatic\" to the backend and would be ignored.")
@@ -666,7 +682,10 @@ o.description = translate("Runs one traceroute and uses the nearest hop that als
 	"plain ping as the latency target. A hop inside your ISP shows your own access link's " ..
 	"queue instead of the far end of the internet.")
 o.write = function()
-	require("luci.sys").call("/etc/init.d/prio pickprobe >/dev/null 2>&1")
+	-- One traceroute plus up to four pings is twenty seconds on a bad route,
+	-- and this used to run inside the request: the whole page froze with no
+	-- progress. Spawn it detached; the result shows up on the next load.
+	require("luci.sys").call("(/etc/init.d/prio pickprobe >/dev/null 2>&1) &")
 end
 else
 o = s:option(DummyValue, "_pick_probe_off", translate("Pick the probe target"))
@@ -724,6 +743,18 @@ o.rmempty = false
 -- All bands strict is rejected: ETS needs one DRR band left over.
 for n = 1, get_bands() - 1 do
 	o:value(tostring(n), translatef("%d level(s)", n))
+end
+-- A stored value can point past the last option after "bands" shrinks. The
+-- dropdown then has no match, renders the first entry and saves that: strict
+-- priority was silently dropped to one level.
+o.cfgvalue = function(self, section)
+	local okv, raw = pcall(function() return uci:get("prio", "main", "strict_bands") end)
+	local v = okv and tonumber(raw) or 1
+	local maxk = get_bands() - 1
+	if maxk < 1 then maxk = 1 end
+	if v < 1 then v = 1 end
+	if v > maxk then v = maxk end
+	return tostring(v)
 end
 o.description = translate("How many bands are absolutely prioritised, taken from band 0 " ..
 	"upwards. The rest share the leftover bandwidth fairly, with no order between them. " ..
@@ -799,6 +830,13 @@ o = s:option(ListValue, "lan_iface", translate("LAN Interface"))
 o.default = "br-lan"
 o.rmempty = false
 o.description = translate("Where the downlink shaper is attached. Usually br-lan.")
+o.validate = function(self, value)
+	local okw, wan = pcall(function() return uci:get("prio", "main", "wan_iface") end)
+	if okw and wan and wan == value then
+		return nil, translate("LAN and WAN must be different interfaces")
+	end
+	return value
+end
 o:value("br-lan", "br-lan")
 if ok_dev and type(devs) == "table" then
 	for _, dv in ipairs(devs) do

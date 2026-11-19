@@ -16,9 +16,11 @@
 #   Marks are OR-ed in, never written as a whole word, to preserve other modules.
 #
 # Downlink hierarchy:
-#   root tbf (rate = learned WAN rate, creates the backlog)
-#     class 10:1
+#   root htb 1:
+#     class 1:1       10 Gbit, unmarked (traffic the router itself originates)
+#     class 1:100     <total gate>, marked internet traffic
 #       ets bands N strict K  (priority; K = strict_bands, 1..N-1)
+#         band 0 takes its leaf directly; the others hang under 2N: htb valves
 #         1:1..1:N fq_codel   (per-band fairness)
 #
 # Why not ifb: the ifb egress qdisc runs before netfilter PREROUTING, so the
@@ -47,7 +49,6 @@ EFFECTIVE_STATE=/var/run/c2000max-hnat-effective
 NFT_TABLE="inet luci_prio"
 MARK_BASE=0x010000
 MARK_MASK=0x00ff0000
-TBF_HANDLE=10
 UNMARK_MASK=0xff00ffff
 
 state_get() { uci -q get "prio.main.$1"; }
@@ -250,7 +251,10 @@ band_mark() {
 }
 
 qdisc_is_ours() {
-	tc qdisc show dev "$1" 2>/dev/null | grep -qE 'qdisc htb 1: root|qdisc ets 2: root|qdisc tbf 10: root|qdisc ets 1: root'
+	# tbf 10: is the pre-r100 layout, kept so an upgrade cleans it away.
+	# ets 1: was in this list by mistake: nothing here ever created that
+	# handle, so the only thing it could match is another package's queue.
+	tc qdisc show dev "$1" 2>/dev/null | grep -qE 'qdisc htb 1: root|qdisc ets 2: root|qdisc tbf 10: root'
 }
 
 wait_hnat_down() {
@@ -330,10 +334,6 @@ valve_of() {
 # Total gate handed to tc verbatim.
 total_kbit() {
 	shaper_kbit
-}
-
-valve_kbit() {
-	valve_of "$(total_kbit)"
 }
 
 # Per-band valve: every band except the top one gets its own HTB class capped at
