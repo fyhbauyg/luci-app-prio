@@ -549,7 +549,7 @@ o.description = translate("Only used when \"Measure the line automatically\" is 
 
 o = s:option(Value, "shaper_margin", translate("Safety margin (%)"))
 o.default = 10
-o.datatype = "range(0,100)"
+o.datatype = "range(0,50)"
 o.rmempty = false
 o.description = translate("How far below the measured capacity to run, in percent. " ..
 	"Only the measured value is reduced; a rate typed in by hand is used exactly as " ..

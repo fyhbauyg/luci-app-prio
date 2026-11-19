@@ -200,6 +200,13 @@ acquire_lock() {
 			rm -rf "$PRIO_LOCK" 2>/dev/null
 			continue
 		fi
+		# mkdir() succeeded but the pid write did not (killed in between, or
+		# the disk broke). Nothing can ever reclaim that lock by the check
+		# above, and every later start would wait 30 s and give up.
+		if [ -z "$owner" ] && [ "$i" -ge 5 ]; then
+			rm -rf "$PRIO_LOCK" 2>/dev/null
+			continue
+		fi
 		i=$((i + 1))
 		if [ "$i" -ge 30 ]; then
 			echo "lock:timeout" >> "$PRIO_STATE/err"
@@ -937,7 +944,7 @@ setup_downlink() {
 stop_refresh() {
 	local pid
 	pid="$(cat "$PRIO_STATE/refresh.pid" 2>/dev/null)"
-	if [ -n "$pid" ]; then
+	if [ -n "$pid" ] && grep -qa prio "/proc/$pid/cmdline" 2>/dev/null; then
 		kill "$pid" 2>/dev/null
 	fi
 	printf 'stopped.%s\n' "$$" > "$PRIO_STATE/refresh_gen" 2>/dev/null
@@ -985,7 +992,9 @@ start_refresh() {
 stop_detect() {
 	local pid
 	pid="$(cat "$DETECT_PID" 2>/dev/null)"
-	if [ -n "$pid" ]; then
+	# The pidfile outlives a detector that exited on its own and pids get
+	# recycled, so confirm the process is still ours before signalling it.
+	if [ -n "$pid" ] && grep -qa prio "/proc/$pid/cmdline" 2>/dev/null; then
 		kill "$pid" 2>/dev/null
 		sleep 1
 		kill -9 "$pid" 2>/dev/null
@@ -1007,13 +1016,19 @@ refresh_status_rate() {
 	local key="$1" total="$2" valve="$3" st="$PRIO_STATE/status" tmp
 	[ -f "$st" ] || return 0
 	tmp="$st.$$"
-	grep -vE "^(${key}|valve|upvalve):" "$st" > "$tmp" 2>/dev/null
-	printf '%s:%skbit\n' "$key" "$total" >> "$tmp"
-	if [ "$key" = "shaper" ]; then
-		printf 'valve:%skbit\n' "$valve" >> "$tmp"
-	else
-		printf 'upvalve:%skbit\n' "$valve" >> "$tmp"
-	fi
+	# Only the rows this call owns. Deleting all three every time dropped the
+	# other direction's row until the next change on that side, and the uplink
+	# branch used to write upvalve twice: once with the total, once with the
+	# valve. The uplink total lives in $PRIO_STATE/upshaper, not here.
+	case "$key" in
+	upvalve)
+		grep -vE '^upvalve:' "$st" > "$tmp" 2>/dev/null
+		printf 'upvalve:%skbit\n' "$valve" >> "$tmp" ;;
+	*)
+		grep -vE '^(shaper|valve):' "$st" > "$tmp" 2>/dev/null
+		printf 'shaper:%skbit\n' "$total" >> "$tmp"
+		printf 'valve:%skbit\n' "$valve" >> "$tmp" ;;
+	esac
 	mv "$tmp" "$st" 2>/dev/null
 }
 
@@ -1026,9 +1041,14 @@ apply_rate() {
 	burst=$((rate / 8 * 20))
 	[ "$burst" -lt 8192 ] && burst=8192
 	[ "$burst" -gt 256000 ] && burst=256000
-	tc class change dev "$dev" parent 1: classid 1:100 \
+	if ! tc class change dev "$dev" parent 1: classid 1:100 \
 		htb rate "${rate}kbit" ceil "${rate}kbit" \
-		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"
+		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err"; then
+		# The tree is gone or busy; saying nothing would leave the page and the
+		# next window believing a rate that the kernel never took.
+		echo "downlink:fail" >> "$PRIO_STATE/status"
+		return 1
+	fi
 	valve="$(valve_of "$rate")"
 	set_band_valves "$dev" "$bands" "$valve"
 	# The page reads these lines. An in-place change used to leave the previous
@@ -1221,6 +1241,12 @@ start_detect() {
 			fi
 			[ "$cur_tx" -gt 0 ] && last_tx=$cur_tx
 			if [ -z "$cur" ]; then
+				# This fires every few seconds for as long as the modem is
+				# gone, into tmpfs, and only start() ever truncates the file.
+				if [ "$(wc -c < "$PRIO_STATE/err" 2>/dev/null || echo 0)" -gt 65536 ]; then
+					tail -n 200 "$PRIO_STATE/err" > "$PRIO_STATE/err.tmp" 2>/dev/null &&
+						mv "$PRIO_STATE/err.tmp" "$PRIO_STATE/err" 2>/dev/null
+				fi
 				echo "detect:gone" >> "$PRIO_STATE/err"
 				sleep 5
 				continue
@@ -1357,6 +1383,10 @@ start_detect() {
 				if apply_downlink_rate "$lan" "$bands" "$rate"; then
 					printf '%s\n' "$rate" > "$PRIO_STATE/shaper"
 					logger -t luci-app-prio "rate seeded from traffic: ${rate}kbit"
+					# Same quiet window measure() gives itself: the modem has
+					# not drained yet, so judging the round trip right now cut
+					# 10-30% off the rate that was just seeded.
+					printf '%s\n' "$(date +%s)" > "$PRIO_STATE/last_measure" 2>/dev/null
 				fi
 			fi
 
@@ -1757,8 +1787,11 @@ measure() {
 	if [ -f "$PRIO_STATE/measuring" ]; then
 		local mage
 		mage=$(( $(date +%s) - $(date -r "$PRIO_STATE/measuring" +%s 2>/dev/null || echo 0) ))
-		# a marker older than this cannot belong to a live measurement
-		[ "$mage" -gt 120 ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; mea_fail busy; return 1; }
+		# A legal run can take 4*secs+40 for the speedtest plus the HTTP
+		# fallback, so a flat 120 was shorter than the thing it guards: a
+		# second start could delete a live marker and measure on top of it.
+		local mttl=$(( secs * 4 + 90 ))
+		[ "$mage" -gt "$mttl" ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; mea_fail busy; return 1; }
 	fi
 	: > "$PRIO_STATE/measuring"
 	trap 'rm -f "$PRIO_STATE/measuring"; : > /tmp/.prio-measure-up 2>/dev/null; : > /tmp/.prio-cnspeed.json 2>/dev/null' EXIT INT TERM
@@ -1768,13 +1801,24 @@ measure() {
 	# during someone else's download reported 433 Mbit on a 200 Mbit line and
 	# pushed the shaper above the capacity, which is exactly the failure that
 	# makes priority useless.
-	local i0 i1 bobs bthr busy_kbit
+	local i0 i1 t0 t1 bobs bthr busy_kbit
 	busy_kbit=0
 	i0=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+	t0=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
 	sleep 2
 	i1=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+	t1=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
 	case "$i0$i1" in ''|*[!0-9]*) ;; *)
 		bobs=$(( (i1 - i0) * 8 / 2 / 1000 ))
+		# The upload leg is measured on tx, and an uploader was invisible to
+		# a guard that only looked at rx: the link looked idle and the upload
+		# sample then counted everyone else's traffic.
+		case "$t0$t1" in ''|*[!0-9]*) ;; *)
+			local bots
+			bots=$(( (t1 - t0) * 8 / 2 / 1000 ))
+			[ "$bots" -gt "$bobs" ] && bobs=$bots
+			;;
+		esac
 		# Proportional threshold. A flat 2000 kbit/s was 10% of the 20 Mbit
 		# line this feature was written for, but only 0.8% of a 267 Mbit
 		# line: there, a phone scrolling a feed already exceeds it and the
@@ -2114,6 +2158,21 @@ start() {
 		release_lock
 		return 1 ;;
 	esac
+	# Changing wan_iface / lan_iface used to leave the old device shaped for
+	# good: setup_* only ever touch the current name and stop() reads the one
+	# recorded at the end of start(). Tear the old tree down while the previous
+	# name is still in $PRIO_STATE.
+	local olddev oldlan
+	olddev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
+	oldlan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"
+	if [ -n "$olddev" ] && [ "$olddev" != "$dev" ] && qdisc_is_ours "$olddev"; then
+		tc qdisc del dev "$olddev" root 2>/dev/null
+		logger -t luci-app-prio "interface changed: dropped the old uplink queue on $olddev"
+	fi
+	if [ -n "$oldlan" ] && [ "$oldlan" != "$lan" ] && qdisc_is_ours "$oldlan"; then
+		tc qdisc del dev "$oldlan" root 2>/dev/null
+		logger -t luci-app-prio "interface changed: dropped the old downlink queue on $oldlan"
+	fi
 	config_get_bool auto_fp main auto_hnat_off 1
 	config_get_bool auto_bw main auto_bandwidth 1
 
