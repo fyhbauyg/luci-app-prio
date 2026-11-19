@@ -16,12 +16,8 @@
 			}
 		},
 		"write": {
-			"file": {
-				"/etc/config/prio": [ "write" ],
-				"/etc/init.d/prio": [ "write", "exec" ]
-			},
 			"ubus": {
-				"uci": [ "prio", "turboacc" ],
+				"uci": [ "prio" ],
 				"service": [ "prio" ]
 			}
 		}

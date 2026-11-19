@@ -742,6 +742,15 @@ apply_uplink_rate() {
 		htb rate "${rate}kbit" ceil "${rate}kbit" \
 		burst "${burst}b" cburst "${burst}b" 2>>"$PRIO_STATE/err" || return 1
 	valve="$(valve_of "$rate")"
+	# A tree built while the uplink rate was still unknown has no valve
+	# classes: setup_uplink() skips add_band_valves() when the valve is below
+	# 1000, so the lower bands stayed uncapped and the in-place change below
+	# failed with ENOENT for the rest of the uptime.
+	if [ "$valve" -ge 1000 ] && [ "$bands" -gt 1 ] &&
+	   ! tc class show dev "$dev" 2>/dev/null | grep -q "htb 21:1 "; then
+		logger -t luci-app-prio "uplink valves missing on $dev, adding them"
+		add_band_valves "$dev" "$bands" "$valve"
+	fi
 	set_band_valves "$dev" "$bands" "$valve"
 	refresh_status_rate upvalve "$rate" "$valve"
 	# The page reads this; setup_uplink only writes it once at start(), so the
@@ -1759,7 +1768,8 @@ measure() {
 	# during someone else's download reported 433 Mbit on a 200 Mbit line and
 	# pushed the shaper above the capacity, which is exactly the failure that
 	# makes priority useless.
-	local i0 i1 bobs bthr
+	local i0 i1 bobs bthr busy_kbit
+	busy_kbit=0
 	i0=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
 	sleep 2
 	i1=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
@@ -1773,10 +1783,18 @@ measure() {
 		bthr=$(( $(shaper_kbit) / 50 ))
 		[ "$bthr" -lt 2000 ] && bthr=2000
 		if [ "$bobs" -gt "$bthr" ]; then
-			echo "measure:busy"
-			logger -t luci-app-prio "measurement skipped: link is busy (${bobs} kbit/s > ${bthr})"
-			mea_fail line-busy "$bobs" "$bthr"
-			return 1
+			if [ "$force" = "force" ]; then
+				# Pressing the button is a deliberate override: keep the number
+				# so the result can be corrected for the traffic the line was
+				# already carrying, instead of quietly reporting too little.
+				busy_kbit=$bobs
+				logger -t luci-app-prio "measuring anyway on request (busy: ${bobs} kbit/s > ${bthr})"
+			else
+				echo "measure:busy"
+				logger -t luci-app-prio "measurement skipped: link is busy (${bobs} kbit/s > ${bthr})"
+				mea_fail line-busy "$bobs" "$bthr"
+				return 1
+			fi
 		fi
 		;;
 	esac
@@ -1920,6 +1938,20 @@ measure() {
 		guard_reject_up=1
 		mea_fail rejected-up
 	fi
+	# A manual run on a busy line only got what was left of it, so add the
+	# background back. The sample is only trusted while that share is a
+	# quarter of the result or less; past that the number is a guess and the
+	# measurement is dropped, which is what the guard would have done anyway.
+	if [ "${busy_kbit:-0}" -gt 0 ] && [ "$dl" -ge 1000 ]; then
+		if [ "$dl" -ge $(( busy_kbit * 4 )) ]; then
+			dl=$(( dl + busy_kbit ))
+			logger -t luci-app-prio "measurement corrected by ${busy_kbit} kbit/s of background traffic"
+		else
+			logger -t luci-app-prio "measurement dropped: ${busy_kbit} kbit/s background against ${dl} kbit/s measured"
+			mea_fail line-busy "$busy_kbit" "$bthr"
+			return 1
+		fi
+	fi
 	dlok=0; ulok=0
 	[ "$dl" -ge 1000 ] && dlok=1
 	[ "$ul" -ge 1000 ] && ulok=1
@@ -1987,7 +2019,7 @@ measure() {
 	# guard_reject: dl is the OLD number here, so applying it would overwrite the
 	# live cut the control loop made with a value the guard just called untrusted.
 	if [ "$(state_get auto_bandwidth)" = "1" ] && [ "$dlok" = 1 ] &&
-	   [ "$guard_reject" != 1 ]; then
+	   [ "$(state_get downlink)" != "0" ] && [ "$guard_reject" != 1 ]; then
 		# In automatic mode the measurement is the estimate. shaper_margin is
 		# applied on top of it when the rate is handed to tc, so the shaped
 		# value ends up at (100 - margin)% of what the line just delivered.
@@ -2038,25 +2070,18 @@ start() {
 	mkdir -p "$PRIO_STATE" 2>/dev/null
 	acquire_lock || return 1
 
-	# One-shot migration from the old "margin on the total" model. The stored
-	# uplink numbers were already reduced by the margin; the new model stores
-	# the raw capacity and takes the margin off the lower bands only. Scaling
-	# them back once keeps the first window after the upgrade at the same real
-	# rate instead of losing the margin twice.
-	if [ ! -f "$PRIO_STATE/ratemodel" ]; then
-		local mp ulv urv
-		mp="$(margin_pct)"
-		ulv="$(state_get uplink_learned)"
-		case "$ulv" in ''|*[!0-9]*) ulv=0 ;; esac
-		if [ "$ulv" -ge 1000 ]; then
-			state_set uplink_learned $(( ulv * 100 / (100 - mp) ))
-		fi
-		urv="$(cat "$PRIO_STATE/up_rate" 2>/dev/null)"
-		case "$urv" in ''|*[!0-9]*) urv=0 ;; esac
-		if [ "$urv" -ge 1000 ]; then
-			printf '%s\n' $(( urv * 100 / (100 - mp) )) > "$PRIO_STATE/up_rate" 2>/dev/null
-		fi
-		printf '2\n' > "$PRIO_STATE/ratemodel" 2>/dev/null
+	# Marker for the rate model. It used to live in $PRIO_STATE, which is
+	# tmpfs: every reboot dropped it, the "one shot" scaling below ran again,
+	# and the learned uplink was multiplied by 100/(100-margin) once per boot
+	# with nothing to stop it.
+	#
+	# An upgrade deliberately does NOT scale. r109 and r110 already ran it once
+	# per boot on this box, so doing it again here would push the uplink gate
+	# further above what the line can carry. Sitting below the real capacity is
+	# the safe direction: the learner raises it from the next clean window.
+	if [ "$(state_get ratemodel)" != "3" ]; then
+		state_set ratemodel 3
+		rm -f "$PRIO_STATE/ratemodel" 2>/dev/null
 	fi
 	: > "$PRIO_STATE/status"
 	: > "$PRIO_STATE/err"
@@ -2072,6 +2097,23 @@ start() {
 	config_get_bool downlink main downlink 1
 	config_get dev main wan_iface eth2
 	config_get lan main lan_iface br-lan
+	# Both names end up inside nft rule text and tc arguments. LuCI cannot
+	# produce anything else, but a hand-edited uci file must not be able to
+	# smuggle a rule separator in here.
+	case "$dev" in
+	''|*[!A-Za-z0-9_.-]*)
+		echo "wan-iface:invalid" >> "$PRIO_STATE/status"
+		diag "start failed: wan_iface rejected"
+		release_lock
+		return 1 ;;
+	esac
+	case "$lan" in
+	''|*[!A-Za-z0-9_.-]*)
+		echo "lan-iface:invalid" >> "$PRIO_STATE/status"
+		diag "start failed: lan_iface rejected"
+		release_lock
+		return 1 ;;
+	esac
 	config_get_bool auto_fp main auto_hnat_off 1
 	config_get_bool auto_bw main auto_bandwidth 1
 
@@ -2199,7 +2241,15 @@ start() {
 	fi
 
 	# 2. netfilter marking
-	setup_nft "$bands" "$dev" "$lan"
+	# The return used to be dropped: with no table every packet fell into the
+	# unshaped 1:1 class, both directions stopped being shaped, and start()
+	# still reported "started" with the page all green.
+	if ! setup_nft "$bands" "$dev" "$lan"; then
+		logger -t luci-app-prio "start failed: nft marking unavailable"
+		diag "start failed: nft"
+		release_lock
+		return 1
+	fi
 
 	# 3. uplink
 	if [ "$uplink" = 1 ]; then
@@ -2265,6 +2315,9 @@ start() {
 	if [ "$uplink" = 1 ] && grep -q 'uplink:fail' "$PRIO_STATE/status" 2>/dev/null; then
 		ok=0
 	fi
+	if grep -q 'nft:fail' "$PRIO_STATE/status" 2>/dev/null; then
+		ok=0
+	fi
 	if [ "$ok" = 0 ]; then
 		logger -t luci-app-prio "start failed: the queue was not installed (wan=$dev lan=$lan)"
 		diag "start failed wan=${dev} lan=${lan} status=$(tr '\n' ',' < "$PRIO_STATE/status" 2>/dev/null)"
@@ -2288,6 +2341,11 @@ stop() {
 	lan="$(cat "$PRIO_STATE/lan" 2>/dev/null)"
 	[ -n "$dev" ] || config_get dev main wan_iface eth2
 	[ -n "$lan" ] || config_get lan main lan_iface br-lan
+
+	# Serialise with start(). Without it the teardown below raced a start()
+	# still waiting for HNAT to go down, and that start put the table, the
+	# queues and "started" back after the switch was already off.
+	acquire_lock || logger -t luci-app-prio "stop: no lock, tearing down anyway"
 
 	stop_detect
 	stop_refresh
@@ -2326,14 +2384,13 @@ stop() {
 	upc="$(cat "$PRIO_STATE/up_cfg" 2>/dev/null)"
 	case "$upc" in ''|*[!0-9]*) upc=0 ;; esac
 	if [ "$upm" -lt 1000 ] && [ "$upc" -lt 1000 ] && [ "$uf" -ge 2000 ]; then
-		acquire_lock
 		state_set uplink_learned "$uf"
-		release_lock
 	fi
 	: > "$PRIO_STATE/status" 2>/dev/null
 	logger -t luci-app-prio "priority engine stopped"
 	diag_maybe_prune
 	diag "engine stopped"
+	release_lock
 }
 
 reload() {

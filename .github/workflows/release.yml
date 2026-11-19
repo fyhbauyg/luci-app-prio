@@ -69,6 +69,8 @@ jobs:
             echo
             echo "架构 \`all\`，任何 OpenWrt / ImmortalWrt 设备通用。"
             echo
+            echo "改动清单见 [README 的更新日志](https://github.com/fyhbauyg/luci-app-prio#更新日志)。"
+            echo
             echo "### 安装"
             echo
             echo '```sh'

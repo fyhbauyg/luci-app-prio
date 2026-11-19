@@ -19,13 +19,16 @@ echo "=== luci-app-prio selftest  $(date) ==="
 
 # 1. 服务
 chk "服务已启动 (status started)" "grep -q started $ST/status"
-chk "状态文件可读 (engine/downlink/uplink)" "grep -q 'priority engine started' /dev/null || true; test -s $ST/status"
+chk "状态文件记录 started 与 nft:ok" "grep -q started $ST/status && grep -q 'nft:ok' $ST/status"
 
 # 2. 下行树
 chk "下行根队列 htb 1: 存在" "tc qdisc show dev $LAN | grep -q 'qdisc htb 1: root'"
 chk "下行受控类 1:100 存在" "tc class show dev $LAN | grep -q 'class htb 1:100'"
 chk "下行内层 ets 2: 存在" "tc qdisc show dev $LAN | grep -q 'qdisc ets 2:'"
-chk "下行带1/带2 阀门类存在" "tc class show dev $LAN | grep -q 'class htb 21:1'"
+# 阀门类只在 bands>1 时存在：带0 不设阀门，其余每带一个 2N:1。
+NBANDS=$(uci -q get prio.main.bands); NBANDS=${NBANDS:-3}
+NVALVE=$((NBANDS - 1))
+chk "下行阀门类数量 = bands-1" "[ \\$(tc class show dev $LAN | grep -c 'class htb 2[0-9]:1') -eq $NVALVE ]"
 # fq_codel 关掉时带内是单队列 pfifo（弱肉强食），此时只有 LAN 类有 fq_codel，
 # 所以按配置判断，而不是假定它一定开着。
 if [ "$(uci -q get prio.main.fq_codel)" = "1" ]; then
@@ -39,7 +42,7 @@ fi
 chk "上行根队列 htb 1: 存在" "tc qdisc show dev $WAN | grep -q 'qdisc htb 1: root'"
 chk "上行受控类 1:100 存在" "tc class show dev $WAN | grep -q 'class htb 1:100'"
 chk "上行内层 ets 2: 存在" "tc qdisc show dev $WAN | grep -q 'qdisc ets 2:'"
-chk "上行带1/带2 阀门类存在" "tc class show dev $WAN | grep -q 'class htb 21:1'"
+chk "上行阀门类数量 = bands-1" "[ \\$(tc class show dev $WAN | grep -c 'class htb 2[0-9]:1') -eq $NVALVE ]"
 
 # 4. 速率与配置一致
 DOWN_APPLIED=$(tc class show dev $LAN classid 1:100 | sed -n 's/.*rate \([0-9]*\)Kbit.*/\1/p')
@@ -246,4 +249,9 @@ uci -q set prio.main.auto_bandwidth=${AUTO_BEFORE:-1}; uci -q commit prio
 /etc/init.d/prio reload >/dev/null 2>&1; sleep 3
 
 echo "=== 结果: PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP ==="
-[ "$FAIL" -eq 0 ] && echo "ALL GOOD" || echo "有失败项，见上面"
+if [ "$FAIL" -eq 0 ]; then
+	echo "ALL GOOD"
+else
+	echo "有失败项，见上面"
+	exit 1
+fi

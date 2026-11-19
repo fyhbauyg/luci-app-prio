@@ -79,7 +79,12 @@ s.anonymous = true
 -- the kernel keeps the page from claiming "running" when nothing is queued.
 local function lan_name()
 	local ok, v = pcall(function() return uci:get("prio", "main", "lan_iface") end)
-	if ok and type(v) == "string" and v ~= "" then return v end
+	-- It is pasted into a shell command two lines down. Only a root session
+	-- can write this key, but a device name has no business containing shell
+	-- syntax, so anything outside that alphabet falls back to the default.
+	if ok and type(v) == "string" and v ~= "" and v:match("^[%w_%-%.]+$") then
+		return v
+	end
 	return "br-lan"
 end
 
@@ -850,12 +855,25 @@ end
 o.default = 0
 o.rmempty = false
 o.width = "20%"
+-- A device keeps whatever band it was given even after "bands" shrinks, so
+-- the stored number can point past the last option. The dropdown then has no
+-- match, renders the first entry and saves that: the device silently jumped
+-- from the lowest band to the highest. Clamp it the way the engine does.
+o.cfgvalue = function(self, section)
+	local v = tonumber(uci:get("prio", section, "band")) or 0
+	if v < 0 or v > bands - 1 then v = bands - 1 end
+	return tostring(v)
+end
 
 -- Upload and download are two independent queues, but one priority is what
 -- people expect; the split is an advanced switch in the section above.
 local ok_split, split = pcall(function() return uci:get("prio", "main", "split_bands") end)
 if ok_split and split == "1" then
 	o = d:option(ListValue, "band_up", translate("Priority Band (upload)"))
+	-- Without an explicit empty entry the widget has nothing to render for
+	-- "same as download": it fell back to the first option, and every save
+	-- wrote band_up=0, i.e. the highest priority, for those devices.
+	o:value("", translate("Same as download"))
 	for i = 0, bands - 1 do
 		o:value(tostring(i), translatef("Band %d", i))
 	end
@@ -863,6 +881,13 @@ if ok_split and split == "1" then
 	o.rmempty = true
 	o.width = "20%"
 	o.description = translate("Empty means the same band as download.")
+	o.cfgvalue = function(self, section)
+		local v = uci:get("prio", section, "band_up")
+		if v == nil or v == "" then return "" end
+		v = tonumber(v) or 0
+		if v < 0 or v > bands - 1 then v = bands - 1 end
+		return tostring(v)
+	end
 end
 
 -- ============================================================

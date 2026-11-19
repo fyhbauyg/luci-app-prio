@@ -426,3 +426,6 @@ msgstr "日志已关闭"
 
 msgid "Rate changes, measurements and a per-band snapshot every few minutes, kept in /root/prio-diag.log. Switching it off stops new lines; both the file and the rotated copy .1 are still pruned by age."
 msgstr "记录速率变化、测量结果，以及每隔几分钟对每条带做一次快照，保存在 /root/prio-diag.log。关掉之后不再写入新行；原有文件连同轮转出的 .1 都会按保留天数清理。"
+
+msgid "Same as download"
+msgstr "与下载相同"
