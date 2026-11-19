@@ -38,19 +38,26 @@ jobs:
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "发布 ${TAG}"
 
+      # GitHub 会把资源名里的 ~ 换成 .，所以先按发布后的真实文件名落一份，
+      # 否则 sha256sums.txt 里的名字和下载下来的对不上。
       - name: 准备产物
         run: |
           set -e
-          cp tools/prio-selftest.sh dist/prio-selftest.sh
-          ls -l dist/
-          ls dist/*.apk > /dev/null
+          mkdir -p upload
+          for f in dist/*.apk; do
+            cp "$f" "upload/$(basename "$f" | tr '~' '.')"
+          done
+          cp tools/prio-selftest.sh upload/prio-selftest.sh
+          ls -l upload/
+          ls upload/*.apk > /dev/null
 
       - name: 生成校验和
         run: |
           set -e
-          cd dist
-          sha256sum *.apk prio-selftest.sh > ../sha256sums.txt
-          cat ../sha256sums.txt
+          cd upload
+          sha256sum * > ../sha256sums.txt
+          cd ..
+          cat sha256sums.txt
 
       - name: 生成 release 说明
         env:
@@ -93,8 +100,7 @@ jobs:
           name: luci-app-prio ${{ steps.ver.outputs.version }}
           body_path: release-body.md
           files: |
-            dist/*.apk
-            dist/prio-selftest.sh
+            upload/*
             sha256sums.txt
           fail_on_unmatched_files: true
           draft: false
