@@ -53,6 +53,10 @@ UNMARK_MASK=0xff00ffff
 
 state_get() { uci -q get "prio.main.$1"; }
 state_set() { uci -q set "prio.main.$1=$2" && uci -q commit prio; }
+# Same, without the commit: for a writer that does not hold the lock. The next
+# locked run commits, and until then the value lives in /tmp/.uci where a
+# concurrent save cannot clobber it.
+state_set_nc() { uci -q set "prio.main.$1=$2"; }
 
 # A measurement can end without changing anything -- the line was busy, another
 # run held the lock, the speedtest client answered nothing. Silently leaving the
@@ -350,9 +354,15 @@ add_band_valves() {
 		vb=$(( valve / 8 * 20 ))
 		[ "$vb" -lt 8192 ] && vb=8192
 		[ "$vb" -gt 128000 ] && vb=128000
-		tc qdisc add dev "$dev" parent "2:$((b + 1))" handle "${vh}:" htb default 1 2>>"$PRIO_STATE/err"
-		tc class add dev "$dev" parent "${vh}:" classid "${vh}:1" htb \
-			rate "${valve}kbit" ceil "${valve}kbit" burst "${vb}b" cburst "${vb}b" 2>>"$PRIO_STATE/err"
+		if ! tc qdisc add dev "$dev" parent "2:$((b + 1))" handle "${vh}:" htb default 1 2>>"$PRIO_STATE/err"; then
+			echo "uplink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
+		if ! tc class add dev "$dev" parent "${vh}:" classid "${vh}:1" htb \
+			rate "${valve}kbit" ceil "${valve}kbit" burst "${vb}b" cburst "${vb}b" 2>>"$PRIO_STATE/err"; then
+			echo "uplink:fail" >> "$PRIO_STATE/status"
+			return 1
+		fi
 		b=$((b + 1))
 	done
 	return 0
@@ -974,7 +984,13 @@ start_refresh() {
 			# being ignored. Reload runs detached so it can replace this loop.
 			[ $((tick % 6)) -eq 0 ] || continue
 			[ "$(state_get enabled)" = "1" ] || continue
-			qdisc_is_ours "$lan" && continue
+			# Both interfaces: netifd recreates the 5G one on a redial and
+			# takes its qdisc with it, which left the uplink unshaped while the
+			# page still said running.
+			wdev="$(cat "$PRIO_STATE/dev" 2>/dev/null)"
+			if qdisc_is_ours "$lan" && { [ -z "$wdev" ] || qdisc_is_ours "$wdev"; }; then
+				continue
+			fi
 			now="$(date +%s 2>/dev/null)"; now="${now:-0}"
 			last="$(cat "$PRIO_STATE/heal.stamp" 2>/dev/null)"; last="${last:-0}"
 			case "$last" in ''|*[!0-9]*) last=0 ;; esac
@@ -1794,7 +1810,10 @@ measure() {
 		[ "$mage" -gt "$mttl" ] && rm -f "$PRIO_STATE/measuring" || { echo "measure:busy"; mea_fail busy; return 1; }
 	fi
 	: > "$PRIO_STATE/measuring"
-	trap 'rm -f "$PRIO_STATE/measuring"; : > /tmp/.prio-measure-up 2>/dev/null; : > /tmp/.prio-cnspeed.json 2>/dev/null' EXIT INT TERM
+	# Under $PRIO_STATE, not /tmp: a fixed name in a world-writable directory
+	# let a local user pre-create a symlink and have root truncate whatever it
+	# pointed at.
+	trap 'rm -f "$PRIO_STATE/measuring"; rm -f "$PRIO_STATE/measure-up" "$PRIO_STATE/cnspeed.json" 2>/dev/null' EXIT INT TERM
 
 	# Only measure an idle line. The counters are per-interface, so any other
 	# client using the link at the same time lands in the same sum -- measuring
@@ -1851,13 +1870,15 @@ measure() {
 	# an international path and reported 185/35 Mbit on a line that this tool
 	# measures at 395-505 down and 100-112 up.
 	if [ "$method" != "http" ] && [ -x /usr/bin/cnspeedtest ] && command -v jq >/dev/null 2>&1; then
-		f=/tmp/.prio-cnspeed.json
+		f="$PRIO_STATE/cnspeed.json"
 		if timeout $(( secs * 4 + 40 )) /usr/bin/cnspeedtest -web=false -json \
 			-duration "${secs}s" -download-threads 8 -upload-threads 4 > "$f" 2>/dev/null &&
 			[ -s "$f" ]; then
 			dl=$(jq -r '.download.AvgMbps // 0' "$f" 2>/dev/null)
 			ul=$(jq -r '.upload.AvgMbps // 0' "$f" 2>/dev/null)
 			node=$(jq -r '.node.name // ""' "$f" 2>/dev/null)
+			# Server-controlled text: a newline here would forge syslog lines.
+			node=$(printf '%s' "$node" | tr -cd '[:print:]' | cut -c1-64)
 			lat=$(jq -r '.latency_ms.avg // 0' "$f" 2>/dev/null)
 			dl=$(awk -v v="${dl:-0}" 'BEGIN{printf "%d", v*1000}')
 			ul=$(awk -v v="${ul:-0}" 'BEGIN{printf "%d", v*1000}')
@@ -1887,7 +1908,7 @@ measure() {
 		if [ "$b" -gt "$a" ]; then dl=$(( (b - a) * 8 / 1000 / secs )); else dl=0; fi
 
 		# --- upload ---
-		f=/tmp/.prio-measure-up
+		f="$PRIO_STATE/measure-up"
 		dd if=/dev/zero of="$f" bs=1048576 count=12 2>/dev/null
 		curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p1=$!
 		curl -s -o /dev/null --max-time $((secs + 20)) -X POST --data-binary @"$f" "$ul_url" 2>/dev/null & p2=$!
@@ -2009,16 +2030,19 @@ measure() {
 	[ "$ulok" = 1 ] || ul="$(state_get measured_ul)"
 
 	acquire_lock || {
-		# store the numbers even without the lock; the next start() will use them
-		state_set measured_dl "$dl"
-		state_set measured_ul "$ul"
+		# No lock. Committing here rewrites /etc/config/prio from a copy that a
+		# concurrent save may already have replaced -- the class of bug the
+		# comment above start() describes. Set the keys without committing and
+		# let the next locked run persist them.
+		state_set_nc measured_dl "$dl"
+		state_set_nc measured_ul "$ul"
 		# Same rules as below: only a real download measurement may refresh the
 		# timestamp, and a rejected result must not clear the failure note.
 		if [ "$dlok" = 1 ] && [ "$guard_reject" != 1 ]; then
-			state_set measured_at "$MEASURE_NOW"
+			state_set_nc measured_at "$MEASURE_NOW"
 		fi
 		if [ "$ulok" = 1 ] && [ "$guard_reject_up" != 1 ]; then
-			state_set measured_at_up "$MEASURE_NOW"
+			state_set_nc measured_at_up "$MEASURE_NOW"
 		fi
 		[ "$guard_reject" = 1 ] || [ "$guard_reject_up" = 1 ] || mea_ok
 		return 0
