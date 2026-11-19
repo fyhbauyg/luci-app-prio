@@ -37,6 +37,10 @@ jobs:
         run: |
           shellcheck -s sh -S error root/etc/init.d/prio tools/prio-selftest.sh
 
+      - name: 引擎行为测试（桩 uci/tc/nft，不需要路由器）
+        run: |
+          sh tests/unit.sh
+
       - name: Lua 语法
         run: |
           luac5.1 -p luasrc/controller/prio.lua luasrc/model/cbi/prio.lua
