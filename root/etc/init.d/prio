@@ -755,7 +755,7 @@ apply_uplink_rate() {
 
 # ---------------- uplink: optional HTB + ETS at eth2 root ----------------
 # Without a rate the uplink is only a scheduler, which is useless the moment
-# someone uploads: the 4G modem buffers a couple of seconds of packets and the
+# someone uploads: the modem buffers a couple of seconds of packets and the
 # router never sees them. With a rate the queue is ours and the bands matter.
 setup_uplink() {
 	local dev="$1" bands="$2"
@@ -1077,7 +1077,7 @@ rtt_avg_ms() {
 	case "$out" in ''|*[!0-9]*) echo 0 ;; *) echo "$out" ;; esac
 }
 
-# Same as rtt_avg_ms, but only when every probe came back. A saturated 4G
+# Same as rtt_avg_ms, but only when every probe came back. A saturated cellular
 # uplink very often answers exactly one of four pings; taking the average of
 # that one reply makes a window full of queue look healthy, which is how a
 # supply-limited sample passed the "modem is not queueing" test.
@@ -1390,7 +1390,7 @@ start_detect() {
 			up=$(up_rate_kbit)
 			# Auto mode: no number anywhere, so learn one -- but only from a
 			# window that proves the modem was NOT queueing. tx_bytes counts
-			# what the kernel handed to the modem driver, and a 4G modem takes
+			# what the kernel handed to the modem driver, and the modem takes
 			# packets and drops them instead of pushing back, so during a burst
 			# this reads far above what the RF link can carry: it measures
 			# supply, not delivery. A window whose own round trip is already
@@ -1418,7 +1418,7 @@ start_detect() {
 						mv "$PRIO_STATE/uptx.tmp" "$PRIO_STATE/uptx" 2>/dev/null
 					# The middle of three windows, not the largest: one burst
 					# must never become the seed. The gate is on the raw
-					# sample, before the margin, otherwise a 3-5 Mbit 4G
+					# sample, before the margin, otherwise a 3-5 Mbit 5G
 					# uplink can never seed at all (10% margin pushed the
 					# smallest useful value under the threshold).
 					useed=$(sort -n "$PRIO_STATE/uptx" 2>/dev/null | sed -n 2p)
@@ -1503,7 +1503,7 @@ start_detect() {
 			fi
 
 			# ---- rate control on measured latency ----
-			# Throughput is useless as a control signal here: this 4G cell moved
+			# Throughput is useless as a control signal here: this cell moved
 			# from 160 to 8 Mbit/s inside an hour, and a download from a slow
 			# server looks exactly like a slow line. Latency does not have that
 			# problem. Measured on the router itself, same traffic:
@@ -1517,7 +1517,7 @@ start_detect() {
 			case "$rtt" in ''|*[!0-9]*) rtt=0 ;; esac
 			base=$(cat "$PRIO_STATE/rtt_base" 2>/dev/null)
 			case "$base" in ''|*[!0-9]*) base=0 ;; esac
-			# base+15 was a dead zone 45 ms wide: with a jittery 4G line the
+			# base+15 was a dead zone 45 ms wide: with a jittery cellular line the
 			# round trip usually landed inside it and the controller did nothing
 			# at all, which is neither "below capacity" nor "over it". The raise
 			# window now scales with the baseline, and the cut is proportional.
@@ -1766,7 +1766,7 @@ measure() {
 	case "$i0$i1" in ''|*[!0-9]*) ;; *)
 		bobs=$(( (i1 - i0) * 8 / 2 / 1000 ))
 		# Proportional threshold. A flat 2000 kbit/s was 10% of the 20 Mbit
-		# 4G line this feature was written for, but only 0.8% of a 267 Mbit
+		# line this feature was written for, but only 0.8% of a 267 Mbit
 		# line: there, a phone scrolling a feed already exceeds it and the
 		# button can never run. 2% of the last estimate keeps the guard real
 		# while letting ordinary background traffic through.
@@ -2413,11 +2413,11 @@ boot() {
 		return 0
 	fi
 
-	# The 4G/5G interface takes tens of seconds to appear after a reboot. Starting
+	# The cellular interface takes tens of seconds to appear after a reboot. Starting
 	# before it exists left the router UNSHAPED -- no queue, no priority -- until
 	# someone noticed, which is exactly what happened twice on 2026-11-18. Wait
 	# for the device and retry the start instead.
-	# Detached: rcS runs boot() synchronously, and a 4G modem can take minutes
+	# Detached: rcS runs boot() synchronously, and the modem can take minutes
 	# to appear. Waiting here would hold up the rest of the boot for nothing.
 	local dev
 	config_get dev main wan_iface eth2

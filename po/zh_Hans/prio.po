@@ -178,8 +178,8 @@ msgstr "保存后立即生效。关闭时恢复之前的加速模式。"
 msgid "Uplink rate (kbit/s)"
 msgstr "上行速率（kbit/s）"
 
-msgid "0 means automatic: the upload stays open until it has seen real upload traffic in three measuring windows (about a minute), then it starts shaping at what the line actually delivered and the same latency controller trims it. Enter a number to pin it instead. Leaving the upload unshaped lets a 4G modem buffer it internally, where this router cannot reorder anything."
-msgstr "填 0 表示全自动：上行先不整形，等测得三次真实上传流量（约一分钟）后，就按线路实际跑到的峰值开始整形，之后交给同一个延迟控制器微调。填具体数值则固定下来。上行长期不整形的话，4G 模组会把上传堆在自己内部，路由器连队列都看不到，自然排不了序。"
+msgid "0 means automatic: the upload stays open until it has seen real upload traffic in three measuring windows (about a minute), then it starts shaping at what the line actually delivered and the same latency controller trims it. Enter a number to pin it instead. Leaving the upload unshaped lets the modem buffer it internally, where this router cannot reorder anything."
+msgstr "填 0 表示全自动：上行先不整形，等测得三次真实上传流量（约一分钟）后，就按线路实际跑到的峰值开始整形，之后交给同一个延迟控制器微调。填具体数值则固定下来。上行长期不整形的话，模组会把上传堆在自己内部，路由器连队列都看不到，自然排不了序。"
 
 msgid "Shape Downlink (download)"
 msgstr "整形下行（下载）"

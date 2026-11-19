@@ -582,7 +582,7 @@ end
 o.description = translate("0 means automatic: the upload stays open until it has seen " ..
 	"real upload traffic in three measuring windows (about a minute), then it starts " ..
 	"shaping at what the line actually delivered and the same latency controller trims " ..
-	"it. Enter a number to pin it instead. Leaving the upload unshaped lets a 4G modem " ..
+	"it. Enter a number to pin it instead. Leaving the upload unshaped lets the modem " ..
 	"buffer it internally, where this router cannot reorder anything.")
 
 o = s:option(DummyValue, "_upshaper", translate("Uplink shaper"))
